@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    database_url: str
+    database_url: str = "sqlite:///./itix.db"
     jwt_secret: str
     qr_secret: str  # clé de chiffrement des QR Codes
     jwt_expire_minutes: int = 480
