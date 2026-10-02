@@ -29,3 +29,13 @@ app.add_middleware(
 )
 for r in (health.router, auth.router, public.router, admin.router):
     app.include_router(r)
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "ITIX Event & Ticketing Platform API",
+        "status": "online",
+        "docs": "/docs",
+    }
+
