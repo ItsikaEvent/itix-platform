@@ -349,11 +349,9 @@ def get_email_status():
     s = get_settings()
     return {
         "configured": smtp_configured(),
-        "smtp_host": s.smtp_host,
-        "smtp_port": s.smtp_port,
-        "smtp_from": s.smtp_from,
-        "smtp_username": s.smtp_username,
-        "has_password": bool(s.smtp_password),
+        "provider": "Resend API",
+        "from": s.resend_from,
+        "has_api_key": bool(s.resend_api_key),
     }
 
 

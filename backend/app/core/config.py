@@ -23,6 +23,11 @@ class Settings(BaseSettings):
         "puis joignez la capture d'écran de la transaction."
     )
 
+    # --- Resend API (remplace SMTP pour le cloud) ---
+    resend_api_key: str = ""
+    resend_from: str = "onboarding@resend.dev"
+
+    # --- Legacy SMTP (kept for backward compat / local dev) ---
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_username: str = ""
