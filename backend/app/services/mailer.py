@@ -21,6 +21,57 @@ def _format_from_header(from_address: str) -> str:
     return f"ITIX Platform <{from_address}>"
 
 
+import socket
+import ssl
+
+class IPv4SMTP(smtplib.SMTP):
+    """SMTP client qui force la résolution et connexion en IPv4 (évite Errno 101 sur les conteneurs cloud)."""
+    def _get_socket(self, host, port, timeout):
+        err = None
+        try:
+            for res in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
+                af, socktype, proto, canonname, sa = res
+                sock = None
+                try:
+                    sock = socket.socket(af, socktype, proto)
+                    sock.settimeout(timeout)
+                    sock.connect(sa)
+                    return sock
+                except OSError as e:
+                    err = e
+                    if sock is not None:
+                        sock.close()
+        except Exception as e:
+            err = e
+        if err is not None:
+            log.warning("Échec IPv4 direct, tentative via fallback standard: %s", err)
+        return super()._get_socket(host, port, timeout)
+
+
+class IPv4SMTP_SSL(smtplib.SMTP_SSL):
+    """SMTP_SSL client qui force la résolution et connexion en IPv4."""
+    def _get_socket(self, host, port, timeout):
+        err = None
+        try:
+            for res in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
+                af, socktype, proto, canonname, sa = res
+                sock = None
+                try:
+                    sock = socket.socket(af, socktype, proto)
+                    sock.settimeout(timeout)
+                    sock.connect(sa)
+                    return self.context.wrap_socket(sock, server_hostname=self._host)
+                except OSError as e:
+                    err = e
+                    if sock is not None:
+                        sock.close()
+        except Exception as e:
+            err = e
+        if err is not None:
+            log.warning("Échec IPv4 direct SSL, tentative via fallback standard: %s", err)
+        return super()._get_socket(host, port, timeout)
+
+
 def _send_smtp_message(msg: EmailMessage, recipient: str) -> None:
     s = get_settings()
     if not s.smtp_host:
@@ -35,10 +86,10 @@ def _send_smtp_message(msg: EmailMessage, recipient: str) -> None:
     try:
         if s.smtp_port == 465:
             log.info("Connexion SMTP sécurisée directe via SSL (port 465)...")
-            smtp_client = smtplib.SMTP_SSL(s.smtp_host, s.smtp_port, timeout=20)
+            smtp_client = IPv4SMTP_SSL(s.smtp_host, s.smtp_port, timeout=20)
         else:
             log.info("Connexion SMTP standard vers %s:%s...", s.smtp_host, s.smtp_port)
-            smtp_client = smtplib.SMTP(s.smtp_host, s.smtp_port, timeout=20)
+            smtp_client = IPv4SMTP(s.smtp_host, s.smtp_port, timeout=20)
 
         with smtp_client as smtp:
             smtp.ehlo()
