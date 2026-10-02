@@ -20,8 +20,12 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="Billetterie Concerts API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
-    CORSMiddleware, allow_origins=get_settings().cors_origins_list,
-    allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware,
+    allow_origins=get_settings().cors_origins_list or ["*"],
+    allow_origin_regex=r"https://.*\.vercel\.app|http://localhost:\d+|https://.*\.onrender\.com",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 for r in (health.router, auth.router, public.router, admin.router):
     app.include_router(r)
