@@ -15,6 +15,16 @@ const defaultProps = {
   strokeLinejoin: "round" as const,
 };
 
+export function Menu({ size = 20, className = "", ...props }: IconProps) {
+  return (
+    <svg width={size} height={size} {...defaultProps} className={className} {...props}>
+      <line x1="4" x2="20" y1="12" y2="12" />
+      <line x1="4" x2="20" y1="6" y2="6" />
+      <line x1="4" x2="20" y1="18" y2="18" />
+    </svg>
+  );
+}
+
 export function X({ size = 20, className = "", ...props }: IconProps) {
   return (
     <svg width={size} height={size} {...defaultProps} className={className} {...props}>
@@ -440,3 +450,90 @@ export function HelpCircle({ size = 20, className = "", ...props }: IconProps) {
     </svg>
   );
 }
+
+export function Check({ size = 20, className = "", ...props }: IconProps) {
+  return (
+    <svg width={size} height={size} {...defaultProps} className={className} {...props}>
+      <path d="M20 6 9 17l-5-5" />
+    </svg>
+  );
+}
+
+export function Copy({ size = 20, className = "", ...props }: IconProps) {
+  return (
+    <svg width={size} height={size} {...defaultProps} className={className} {...props}>
+      <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
+      <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
+    </svg>
+  );
+}
+
+export function ExternalLink({ size = 20, className = "", ...props }: IconProps) {
+  return (
+    <svg width={size} height={size} {...defaultProps} className={className} {...props}>
+      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+      <polyline points="15 3 21 3 21 9" />
+      <line x1="10" x2="21" y1="14" y2="3" />
+    </svg>
+  );
+}
+
+export function Building({ size = 20, className = "", ...props }: IconProps) {
+  return (
+    <svg width={size} height={size} {...defaultProps} className={className} {...props}>
+      <rect width="16" height="20" x="4" y="2" rx="2" ry="2" />
+      <path d="M9 22v-4h6v4" />
+      <path d="M8 6h.01" />
+      <path d="M16 6h.01" />
+      <path d="M12 6h.01" />
+      <path d="M12 10h.01" />
+      <path d="M12 14h.01" />
+      <path d="M16 10h.01" />
+      <path d="M16 14h.01" />
+      <path d="M8 10h.01" />
+      <path d="M8 14h.01" />
+    </svg>
+  );
+}
+
+export function KeyRound({ size = 20, className = "", ...props }: IconProps) {
+  return (
+    <svg width={size} height={size} {...defaultProps} className={className} {...props}>
+      <path d="M2 18v3c0 .6.4 1 1 1h4v-3h3v-3h2l1.4-1.4a6.5 6.5 0 1 0-4-4Z" />
+      <circle cx="16.5" cy="7.5" r=".5" fill="currentColor" />
+    </svg>
+  );
+}
+
+export function FileText({ size = 20, className = "", ...props }: IconProps) {
+  return (
+    <svg width={size} height={size} {...defaultProps} className={className} {...props}>
+      <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+      <path d="M14 2v4a2 2 0 0 0 2 2h4" />
+      <path d="M10 9H8" />
+      <path d="M16 13H8" />
+      <path d="M16 17H8" />
+    </svg>
+  );
+}
+
+export function Scale({ size = 20, className = "", ...props }: IconProps) {
+  return (
+    <svg width={size} height={size} {...defaultProps} className={className} {...props}>
+      <path d="m16 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z" />
+      <path d="m2 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z" />
+      <path d="M7 21h10" />
+      <path d="M12 3v18" />
+      <path d="M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2" />
+    </svg>
+  );
+}
+
+export function Phone({ size = 20, className = "", ...props }: IconProps) {
+  return (
+    <svg width={size} height={size} {...defaultProps} className={className} {...props}>
+      <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z" />
+    </svg>
+  );
+}
+
