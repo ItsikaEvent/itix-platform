@@ -11,7 +11,8 @@ import {
 } from "../../components/icons";
 import { api, errorMessage, fileUrl } from "../../api/client";
 import { Button, ErrorBox, Field, Modal, Spinner, inputCls } from "../../components/ui";
-import type { Concert } from "../../types";
+import { useAuth } from "../../context/AuthContext";
+import type { Concert, Organizer } from "../../types";
 import { formatAr, formatDateTime, toInputDate } from "../../utils/format";
 
 interface TypeRow {
@@ -23,10 +24,14 @@ interface TypeRow {
 
 function ConcertForm({
   concert,
+  organizers,
+  isSuperAdmin,
   onClose,
   onSaved,
 }: {
   concert: Concert | null;
+  organizers: Organizer[];
+  isSuperAdmin: boolean;
   onClose: () => void;
   onSaved: () => void;
 }) {
@@ -35,6 +40,7 @@ function ConcertForm({
   const [description, setDescription] = useState(concert?.description ?? "");
   const [date, setDate] = useState(concert ? toInputDate(concert.date) : "");
   const [seats, setSeats] = useState(String(concert?.total_seats ?? ""));
+  const [organizerId, setOrganizerId] = useState<number | "">(concert?.organizer_id ?? "");
   const [poster, setPoster] = useState<File | null>(null);
   const [types, setTypes] = useState<TypeRow[]>(
     concert?.ticket_types.map((t) => ({
@@ -59,6 +65,9 @@ function ConcertForm({
     fd.append("description", description);
     fd.append("date", date);
     fd.append("total_seats", seats);
+    if (isSuperAdmin && organizerId) {
+      fd.append("organizer_id", String(organizerId));
+    }
     fd.append(
       "ticket_types",
       JSON.stringify(
@@ -92,6 +101,23 @@ function ConcertForm({
       wide
     >
       <form onSubmit={submit} className="space-y-4">
+        {isSuperAdmin && (
+          <Field label="Organisateur propriétaire (Super Admin)">
+            <select
+              className={inputCls}
+              value={organizerId}
+              onChange={(e) => setOrganizerId(e.target.value ? Number(e.target.value) : "")}
+            >
+              <option value="">-- Assigner à vous-même (Super Admin) --</option>
+              {organizers.map((o) => (
+                <option key={o.id} value={o.id}>
+                  {o.name} ({o.email})
+                </option>
+              ))}
+            </select>
+          </Field>
+        )}
+
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="Titre du Concert / Récital">
             <input
@@ -152,7 +178,7 @@ function ConcertForm({
           />
         </Field>
 
-        <div className="space-y-3 border border-[#E4DCD0] bg-[#FAF8F3] p-4">
+        <div className="space-y-3 border border-[#E4DCD0] bg-[#FAF8F3] p-4 rounded-xl">
           <div className="flex items-center justify-between">
             <p className="text-xs font-bold text-[#111111] uppercase tracking-wider">
               Catégories & Tarification
@@ -191,20 +217,20 @@ function ConcertForm({
                 type="number"
                 min={1}
                 className={inputCls}
-                placeholder="Quota places"
+                placeholder="Quantité"
                 value={t.quantity}
                 onChange={(e) => setRow(i, { quantity: e.target.value })}
                 required
               />
-              <button
-                type="button"
-                disabled={types.length === 1}
-                onClick={() => setTypes((r) => r.filter((_, j) => j !== i))}
-                className="flex h-9 w-9 items-center justify-center border border-red-200 bg-red-50 text-red-700 hover:bg-red-100 disabled:opacity-30 cursor-pointer"
-                aria-label="Supprimer"
-              >
-                <X className="h-4 w-4" />
-              </button>
+              {types.length > 1 && (
+                <button
+                  type="button"
+                  onClick={() => setTypes((r) => r.filter((_, j) => j !== i))}
+                  className="mb-1 p-2 text-[#888888] hover:text-red-700"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              )}
             </div>
           ))}
 
@@ -221,12 +247,16 @@ function ConcertForm({
 
         <ErrorBox message={error} />
 
-        <div className="flex justify-end gap-3 pt-2">
-          <Button type="button" variant="outline" onClick={onClose}>
+        <div className="flex items-center justify-end gap-3 pt-3">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-4 py-2 text-xs text-[#666666] hover:text-[#111111]"
+          >
             Annuler
-          </Button>
+          </button>
           <Button type="submit" disabled={busy}>
-            {busy ? "Enregistrement en cours…" : "Valider l'événement"}
+            {busy ? "Enregistrement…" : concert ? "Mettre à jour" : "Créer le concert"}
           </Button>
         </div>
       </form>
@@ -235,19 +265,32 @@ function ConcertForm({
 }
 
 export default function Concerts() {
+  const { isSuperAdmin } = useAuth();
   const [list, setList] = useState<Concert[] | null>(null);
+  const [organizers, setOrganizers] = useState<Organizer[]>([]);
+  const [selectedOrgFilter, setSelectedOrgFilter] = useState<number | "">("");
   const [editing, setEditing] = useState<Concert | null | undefined>(undefined);
   const [error, setError] = useState("");
 
-  const load = () =>
+  const load = () => {
+    const url = selectedOrgFilter
+      ? `/api/admin/concerts?organizer_id=${selectedOrgFilter}`
+      : "/api/admin/concerts";
     api
-      .get<Concert[]>("/api/concerts")
+      .get<Concert[]>(url)
       .then((r) => setList(r.data))
       .catch((e) => setError(errorMessage(e)));
+  };
+
+  useEffect(() => {
+    if (isSuperAdmin) {
+      api.get<Organizer[]>("/api/admin/organizers").then((r) => setOrganizers(r.data)).catch(() => {});
+    }
+  }, [isSuperAdmin]);
 
   useEffect(() => {
     load();
-  }, []);
+  }, [selectedOrgFilter]);
 
   const remove = async (c: Concert) => {
     if (!confirm(`Supprimer définitivement la fiche « ${c.name} » ?`)) return;
@@ -262,27 +305,44 @@ export default function Concerts() {
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[#E4DCD0] pb-5">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[#ECEAE6] pb-5">
         <div>
-          <span className="text-xs font-semibold uppercase tracking-widest text-[#C6A15B]">
+          <span className="text-xs font-semibold uppercase tracking-widest text-[#641C2D]">
             Catalogue d'événements
           </span>
           <h1 className="font-serif text-2xl md:text-3xl font-bold text-[#111111] mt-0.5">
             Gestion des Concerts & Représentations
           </h1>
           <p className="text-xs text-[#66625B] mt-1">
-            Création, mise à jour des programmes et répartition des quotas
+            Création, mise à jour des programmes et gestion des jauges
           </p>
         </div>
 
-        <Button
-          onClick={() => setEditing(null)}
-          variant="primary"
-          className="text-xs self-start sm:self-auto"
-        >
-          <Plus className="h-3.5 w-3.5 mr-1" />
-          <span>Créer un Événement</span>
-        </Button>
+        <div className="flex items-center gap-3">
+          {isSuperAdmin && organizers.length > 0 && (
+            <select
+              value={selectedOrgFilter}
+              onChange={(e) => setSelectedOrgFilter(e.target.value ? Number(e.target.value) : "")}
+              className="rounded-lg border border-[#DCD9D3] bg-[#FFFFFF] px-3 py-2 text-xs text-[#111111] focus:border-[#641C2D] focus:outline-none"
+            >
+              <option value="">Tous les organisateurs</option>
+              {organizers.map((o) => (
+                <option key={o.id} value={o.id}>
+                  {o.name}
+                </option>
+              ))}
+            </select>
+          )}
+
+          <Button
+            onClick={() => setEditing(null)}
+            variant="primary"
+            className="text-xs"
+          >
+            <Plus className="h-3.5 w-3.5 mr-1" />
+            <span>Créer un Événement</span>
+          </Button>
+        </div>
       </div>
 
       <ErrorBox message={error} />
@@ -292,9 +352,9 @@ export default function Concerts() {
         {list?.map((c) => (
           <div
             key={c.id}
-            className="flex gap-4 border border-[#E4DCD0] bg-[#FFFFFF] p-5 shadow-sm hover:border-[#C6A15B]"
+            className="flex gap-4 border border-[#ECEAE6] bg-[#FFFFFF] p-5 rounded-2xl shadow-sm hover:border-[#641C2D] transition-colors"
           >
-            <div className="h-32 w-24 shrink-0 overflow-hidden bg-[#111111] border border-[#E4DCD0]">
+            <div className="h-32 w-24 shrink-0 overflow-hidden bg-[#111111] border border-[#ECEAE6] rounded-xl">
               {c.poster_url ? (
                 <img
                   src={fileUrl(c.poster_url)!}
@@ -303,13 +363,18 @@ export default function Concerts() {
                 />
               ) : (
                 <div className="flex h-full w-full items-center justify-center text-[#66625B]">
-                  <Music className="h-8 w-8 text-[#C6A15B]" />
+                  <Music className="h-8 w-8 text-[#641C2D]" />
                 </div>
               )}
             </div>
 
             <div className="min-w-0 flex-1 flex flex-col justify-between">
               <div>
+                {c.organizer_name && (
+                  <span className="inline-block text-[11px] font-semibold text-[#641C2D] mb-1">
+                    {c.organizer_name}
+                  </span>
+                )}
                 <h2 className="truncate font-serif font-bold text-[#111111] text-base">
                   {c.name}
                 </h2>
@@ -320,7 +385,7 @@ export default function Concerts() {
                     <span>{formatDateTime(c.date)}</span>
                   </div>
                   <div className="flex items-center gap-1.5">
-                    <MapPin className="h-3.5 w-3.5 text-[#C6A15B]" />
+                    <MapPin className="h-3.5 w-3.5 text-[#641C2D]" />
                     <span className="truncate">{c.venue}</span>
                   </div>
                   <div className="flex items-center gap-1.5 text-[#111111]">
@@ -336,7 +401,7 @@ export default function Concerts() {
                   {c.ticket_types.map((t) => (
                     <span
                       key={t.id}
-                      className="inline-block border border-[#E4DCD0] bg-[#FAF8F3] px-2 py-0.5 text-[10px] text-[#55524B]"
+                      className="inline-block border border-[#ECEAE6] bg-[#FAF8F3] px-2 py-0.5 text-[10px] text-[#55524B] rounded"
                     >
                       {t.name} {formatAr(t.price)}
                     </span>
@@ -344,7 +409,7 @@ export default function Concerts() {
                 </div>
               </div>
 
-              <div className="mt-3 flex gap-2 pt-2 border-t border-[#EFE9DC]">
+              <div className="mt-3 flex gap-2 pt-2 border-t border-[#F2F0EC]">
                 <Button
                   variant="outline"
                   className="text-xs py-1 px-3"
@@ -368,7 +433,7 @@ export default function Concerts() {
       </div>
 
       {list?.length === 0 && (
-        <div className="border border-[#E4DCD0] bg-[#FFFFFF] p-12 text-center text-[#66625B]">
+        <div className="border border-[#ECEAE6] bg-[#FFFFFF] p-12 text-center text-[#66625B] rounded-2xl shadow-sm">
           <Music className="h-10 w-10 text-[#641C2D] mx-auto mb-2" />
           <p className="font-serif text-base font-semibold text-[#111111]">
             Aucun événement configuré
@@ -382,6 +447,8 @@ export default function Concerts() {
       {editing !== undefined && (
         <ConcertForm
           concert={editing}
+          organizers={organizers}
+          isSuperAdmin={isSuperAdmin}
           onClose={() => setEditing(undefined)}
           onSaved={() => {
             setEditing(undefined);

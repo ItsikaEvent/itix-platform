@@ -21,6 +21,7 @@ import {
   inputCls,
 } from "../../components/ui";
 import type { Concert, Delivery, Order } from "../../types";
+import { useAuth } from "../../context/AuthContext";
 import { formatAr, formatDateTime } from "../../utils/format";
 
 function OrderModal({
@@ -389,14 +390,17 @@ function OrderModal({
 }
 
 export default function Orders() {
+  const { isSuperAdmin } = useAuth();
   const [params, setParams] = useSearchParams();
   const concertId = params.get("concert_id") ?? "";
+  const organizerId = params.get("organizer_id") ?? "";
   const status = params.get("status") ?? "";
   const payment = params.get("payment") ?? "";
   const q = params.get("q") ?? "";
   const page = Number(params.get("page") ?? 1);
 
   const [concerts, setConcerts] = useState<Concert[]>([]);
+  const [organizers, setOrganizers] = useState<{ id: number; name: string }[]>([]);
   const [search, setSearch] = useState(q);
   const [data, setData] = useState<{
     items: Order[];
@@ -415,17 +419,27 @@ export default function Orders() {
   };
 
   useEffect(() => {
+    if (isSuperAdmin) {
+      api.get("/api/admin/organizers").then((r) => setOrganizers(r.data)).catch(() => {});
+    }
+  }, [isSuperAdmin]);
+
+  useEffect(() => {
+    const url = isSuperAdmin && organizerId
+      ? `/api/admin/concerts?organizer_id=${organizerId}`
+      : "/api/admin/concerts";
     api
-      .get<Concert[]>("/api/concerts")
+      .get<Concert[]>(url)
       .then((r) => setConcerts(r.data))
       .catch(() => {});
-  }, []);
+  }, [isSuperAdmin, organizerId]);
 
   const load = () =>
     api
       .get("/api/admin/orders", {
         params: {
           concert_id: concertId || undefined,
+          organizer_id: (isSuperAdmin && organizerId) ? organizerId : undefined,
           status: status || undefined,
           payment: payment || undefined,
           q: q || undefined,
@@ -439,15 +453,15 @@ export default function Orders() {
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [concertId, status, payment, q, page]);
+  }, [concertId, organizerId, status, payment, q, page]);
 
   const pages = data ? Math.max(1, Math.ceil(data.total / data.page_size)) : 1;
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[#E4DCD0] pb-5">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[#ECEAE6] pb-5">
         <div>
-          <span className="text-xs font-semibold uppercase tracking-widest text-[#C6A15B]">
+          <span className="text-xs font-semibold uppercase tracking-widest text-[#641C2D]">
             Registre des Ventes
           </span>
           <h1 className="font-serif text-2xl md:text-3xl font-bold text-[#111111] mt-0.5">
@@ -460,7 +474,22 @@ export default function Orders() {
       </div>
 
       {/* Filters */}
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+        {isSuperAdmin && (
+          <select
+            className={inputCls}
+            value={organizerId}
+            onChange={(e) => setParam("organizer_id", e.target.value)}
+          >
+            <option value="">Tous les organisateurs</option>
+            {organizers.map((o) => (
+              <option key={o.id} value={o.id}>
+                {o.name}
+              </option>
+            ))}
+          </select>
+        )}
+
         <select
           className={inputCls}
           value={concertId}
@@ -479,8 +508,8 @@ export default function Orders() {
           value={status}
           onChange={(e) => setParam("status", e.target.value)}
         >
-          <option value="">Tous les statuts de commande</option>
-          <option value="ACTIVE">Commandes actives (hors refus)</option>
+          <option value="">Tous les statuts</option>
+          <option value="ACTIVE">Actives (hors refus)</option>
           <option value="PENDING">En attente de validation</option>
           <option value="ACCEPTED">Commandes validées</option>
           <option value="REJECTED">Commandes refusées</option>
@@ -491,7 +520,7 @@ export default function Orders() {
           value={payment}
           onChange={(e) => setParam("payment", e.target.value)}
         >
-          <option value="">Tous les statuts de paiement</option>
+          <option value="">Tous les paiements</option>
           <option value="PAID">Paiements validés</option>
           <option value="NOT_PAID">Règlement sur place</option>
           <option value="PROOF_SUBMITTED">Reçu transmis</option>
@@ -520,13 +549,14 @@ export default function Orders() {
       {!data && !error && <Spinner />}
 
       {data && (
-        <div className="border border-[#E4DCD0] bg-[#FFFFFF] shadow-sm overflow-hidden">
+        <div className="border border-[#ECEAE6] bg-[#FFFFFF] shadow-sm overflow-hidden rounded-2xl">
           <div className="overflow-x-auto">
             <table className="itix-table text-xs">
               <thead>
                 <tr>
                   <th>Réf.</th>
                   <th>Auditeur / Contact</th>
+                  {isSuperAdmin && <th>Organisateur</th>}
                   <th>Concert</th>
                   <th>Places</th>
                   <th>Montant</th>
@@ -552,6 +582,11 @@ export default function Orders() {
                           {o.customer_email}
                         </span>
                       </td>
+                      {isSuperAdmin && (
+                        <td className="text-[#641C2D] font-semibold text-[11px]">
+                          {o.organizer_name || "ITIX"}
+                        </td>
+                      )}
                       <td className="font-serif text-[#111111] font-medium">
                         {o.concert_name}
                       </td>

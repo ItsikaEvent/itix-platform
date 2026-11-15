@@ -40,6 +40,11 @@ const STYLE: Record<ScanResult["result"], [string, string, typeof CheckCircle2]>
     "TITRE D'ACCÈS INVALIDE OU INTROUVABLE",
     XCircle,
   ],
+  WRONG_ORGANIZER: [
+    "border-rose-400 bg-rose-50 text-rose-950",
+    "ACCÈS REFUSÉ (ÉVÉNEMENT D'UN AUTRE ORGANISATEUR)",
+    XCircle,
+  ],
 };
 
 export default function Scanner() {

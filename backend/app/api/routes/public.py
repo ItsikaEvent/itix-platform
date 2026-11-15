@@ -1,17 +1,22 @@
+import base64
 import secrets
 from typing import Literal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
-from pydantic import EmailStr
+from fastapi import (APIRouter, BackgroundTasks, Depends, File, Form, HTTPException,
+                     Response, UploadFile)
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.timeutil import local_now
 from app.db.session import get_db
-from app.models.entities import Concert, Order, StoredFile, TicketType
+from app.models.entities import (Admin, ChatMessage, Concert, Order,
+                                 StoredFile, SupportMessage, TicketType)
 from app.services.files import save_image
+from app.services.mailer import send_tickets_email, smtp_configured
 from app.services.presenters import concert_out, sold_map
+from app.services.tickets import ticket_images
 
 router = APIRouter(prefix="/api", tags=["public"])
 
@@ -34,6 +39,27 @@ def get_concert(concert_id: int, db: Session = Depends(get_db)):
     if not c:
         raise HTTPException(404, "Concert introuvable.")
     return concert_out(c, sold_map(db))
+
+
+@router.get("/organizers/{slug}")
+def get_public_organizer(slug: str, db: Session = Depends(get_db)):
+    clean_slug = slug.strip().lower()
+    org = db.scalar(select(Admin).where(Admin.slug == clean_slug, Admin.is_active.is_(True)))
+    if not org:
+        raise HTTPException(404, "Organisateur introuvable.")
+    sold = sold_map(db)
+    concerts = db.scalars(
+        select(Concert)
+        .where(Concert.organizer_id == org.id)
+        .order_by(Concert.date.desc())
+    ).all()
+    return {
+        "id": org.id,
+        "name": org.name,
+        "slug": org.slug,
+        "phone": org.phone,
+        "concerts": [concert_out(c, sold) for c in concerts],
+    }
 
 
 @router.get("/files/{file_id}")
@@ -63,9 +89,14 @@ def create_order(
     customer_name: str = Form(..., min_length=2, max_length=120),
     customer_email: EmailStr = Form(...),
     pay_mode: Literal["PAY_NOW", "RESERVE"] = Form(...),
+    consent_cgu_cgv: bool = Form(True),
+    consent_privacy: bool = Form(True),
     proof: UploadFile | None = File(None),
     db: Session = Depends(get_db),
 ):
+    if not consent_cgu_cgv or not consent_privacy:
+        raise HTTPException(422, "Vous devez accepter les CGV, les CGU et la Politique de Confidentialité.")
+
     has_proof = proof is not None and bool(proof.filename)
     if pay_mode == "PAY_NOW" and not has_proof:
         raise HTTPException(422, "La preuve de paiement est obligatoire pour payer maintenant.")
@@ -87,28 +118,32 @@ def create_order(
 
     proof_file = save_image(db, proof) if pay_mode == "PAY_NOW" and has_proof else None
     order = Order(
-        reference=_new_reference(db), concert_id=concert_id, ticket_type_id=tt.id,
-        customer_name=customer_name.strip(), customer_email=str(customer_email).lower(),
-        quantity=quantity, unit_price=tt.price, total_amount=tt.price * quantity,
-        pay_mode=pay_mode, proof_file_id=proof_file.id if proof_file else None,
+        reference=_new_reference(db),
+        concert_id=concert_id,
+        ticket_type_id=tt.id,
+        customer_name=customer_name.strip(),
+        customer_email=str(customer_email).lower(),
+        quantity=quantity,
+        unit_price=tt.price,
+        total_amount=tt.price * quantity,
+        pay_mode=pay_mode,
+        consent_cgu_cgv=consent_cgu_cgv,
+        consent_privacy=consent_privacy,
+        proof_file_id=proof_file.id if proof_file else None,
         payment_status="PROOF_SUBMITTED" if proof_file else "UNPAID",
     )
     db.add(order)
     db.commit()
-    return {"reference": order.reference, "quantity": order.quantity,
-            "total_amount": order.total_amount, "customer_email": order.customer_email,
-            "pay_mode": order.pay_mode}
+    return {
+        "reference": order.reference,
+        "quantity": order.quantity,
+        "total_amount": order.total_amount,
+        "customer_email": order.customer_email,
+        "pay_mode": order.pay_mode,
+    }
 
 
 # ------------------------------------------------------------------ Espace Client & Mes Billets
-import base64
-from fastapi import BackgroundTasks
-from pydantic import BaseModel, Field
-from app.models.entities import SupportMessage
-from app.services.mailer import send_tickets_email, smtp_configured
-from app.services.tickets import ticket_images
-
-
 @router.get("/client/orders")
 def get_client_orders(email: str, db: Session = Depends(get_db)):
     clean_email = email.strip().lower()
@@ -132,13 +167,18 @@ def get_client_orders(email: str, db: Session = Depends(get_db)):
                     "qr_image": "data:image/png;base64," + base64.b64encode(p).decode(),
                 })
 
+        org_name = o.concert.organizer.name if o.concert and o.concert.organizer else "ITIX"
+        org_slug = o.concert.organizer.slug if o.concert and o.concert.organizer else "itix"
+
         result.append({
             "id": o.id,
             "reference": o.reference,
-            "concert_name": o.concert.name,
-            "concert_venue": o.concert.venue,
-            "concert_date": o.concert.date.isoformat(),
-            "ticket_type_name": o.ticket_type.name,
+            "concert_name": o.concert.name if o.concert else "",
+            "concert_venue": o.concert.venue if o.concert else "",
+            "concert_date": o.concert.date.isoformat() if o.concert else "",
+            "organizer_name": org_name,
+            "organizer_slug": org_slug,
+            "ticket_type_name": o.ticket_type.name if o.ticket_type else "",
             "quantity": o.quantity,
             "unit_price": o.unit_price,
             "total_amount": o.total_amount,
@@ -186,16 +226,33 @@ class ClientMessageIn(BaseModel):
     customer_email: EmailStr
     customer_name: str = Field(..., min_length=2, max_length=120)
     order_reference: str | None = None
+    concert_id: int | None = None
     subject: str = Field(..., min_length=3, max_length=150)
     message: str = Field(..., min_length=5, max_length=2000)
 
 
 @router.post("/client/messages", status_code=201)
 def create_support_message(body: ClientMessageIn, db: Session = Depends(get_db)):
+    effective_org_id = None
+    effective_cid = body.concert_id
+
+    # Si un numéro de commande est fourni mais pas de concert_id
+    if not effective_cid and body.order_reference:
+        order = db.scalar(select(Order).where(Order.reference == body.order_reference.strip()))
+        if order:
+            effective_cid = order.concert_id
+
+    if effective_cid:
+        concert = db.get(Concert, effective_cid)
+        if concert:
+            effective_org_id = concert.organizer_id
+
     msg = SupportMessage(
         customer_email=str(body.customer_email).lower().strip(),
         customer_name=body.customer_name.strip(),
         order_reference=body.order_reference.strip() if body.order_reference else None,
+        concert_id=effective_cid,
+        organizer_id=effective_org_id,
         subject=body.subject.strip(),
         message=body.message.strip(),
     )
@@ -203,7 +260,7 @@ def create_support_message(body: ClientMessageIn, db: Session = Depends(get_db))
     db.commit()
     return {
         "id": msg.id,
-        "message": "Votre message a été envoyé à l'équipe. Nous vous répondrons rapidement.",
+        "message": "Votre message a été transmis à l'équipe organisatrice. Nous vous répondrons rapidement.",
         "created_at": msg.created_at.isoformat(),
     }
 
@@ -235,13 +292,11 @@ def list_client_messages(email: str, db: Session = Depends(get_db)):
     ]
 
 
-# ------------------------------------------------------------------ Messagerie Instantanée (Chat / SMS Style)
-from app.models.entities import ChatMessage
-
-
+# ------------------------------------------------------------------ Messagerie Instantanée (Chat)
 class ChatMessageIn(BaseModel):
     customer_email: EmailStr
     customer_name: str = Field(..., min_length=2, max_length=120)
+    concert_id: int | None = None
     message: str = Field(..., min_length=1, max_length=2000)
 
 
@@ -262,7 +317,7 @@ def get_chat_history(email: str, db: Session = Depends(get_db)):
             "id": m.id,
             "customer_email": m.customer_email,
             "customer_name": m.customer_name,
-            "sender": m.sender,  # CLIENT | ADMIN
+            "sender": m.sender,
             "message": m.message,
             "created_at": m.created_at.isoformat(),
         }
@@ -272,9 +327,17 @@ def get_chat_history(email: str, db: Session = Depends(get_db)):
 
 @router.post("/client/chat", status_code=201)
 def post_chat_message(body: ChatMessageIn, db: Session = Depends(get_db)):
+    effective_org_id = None
+    if body.concert_id:
+        c = db.get(Concert, body.concert_id)
+        if c:
+            effective_org_id = c.organizer_id
+
     msg = ChatMessage(
         customer_email=str(body.customer_email).lower().strip(),
         customer_name=body.customer_name.strip(),
+        concert_id=body.concert_id,
+        organizer_id=effective_org_id,
         sender="CLIENT",
         message=body.message.strip(),
     )
@@ -290,3 +353,35 @@ def post_chat_message(body: ChatMessageIn, db: Session = Depends(get_db)):
     }
 
 
+# ------------------------------------------------------------------ RGPD & CMIL Madagascar (Loi 2014-038)
+class PrivacyRequestIn(BaseModel):
+    customer_name: str = Field(..., min_length=2, max_length=120)
+    customer_email: EmailStr
+    request_type: Literal["ACCESS", "RECTIFICATION", "DELETION", "OPPOSITION"]
+    details: str = Field(..., min_length=5, max_length=1000)
+
+
+@router.post("/privacy/request", status_code=201)
+def submit_privacy_request(body: PrivacyRequestIn, db: Session = Depends(get_db)):
+    labels = {
+        "ACCESS": "Droit d'accès",
+        "RECTIFICATION": "Droit de rectification",
+        "DELETION": "Droit à l'effacement / suppression",
+        "OPPOSITION": "Droit d'opposition",
+    }
+    label = labels.get(body.request_type, body.request_type)
+    msg = SupportMessage(
+        customer_email=str(body.customer_email).lower().strip(),
+        customer_name=body.customer_name.strip(),
+        subject=f"[RGPD/CMIL - {label}] Exercice des droits sur les données personnelles",
+        message=f"Type de demande : {label} ({body.request_type})\n\nDétails :\n{body.details.strip()}",
+    )
+    db.add(msg)
+    db.commit()
+    return {
+        "message": (
+            "Votre demande d'exercice de vos droits (conforme RGPD et Loi n° 2014-038 / CMIL Madagascar) "
+            "a été enregistrée avec succès. Notre équipe vous apportera une réponse sous un délai légal de 30 jours."
+        ),
+        "request_id": msg.id,
+    }
