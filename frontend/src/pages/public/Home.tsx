@@ -14,10 +14,25 @@ import { api, errorMessage, fileUrl } from "../../api/client";
 import { Badge, CONCERT_STATUS, ErrorBox, Spinner } from "../../components/ui";
 import type { Concert } from "../../types";
 import { formatAr, formatDate, formatTime } from "../../utils/format";
+import { usePageSeo } from "../../utils/seo";
 
 export default function Home() {
   const [concerts, setConcerts] = useState<Concert[] | null>(null);
   const [error, setError] = useState("");
+
+  usePageSeo({
+    title: "Accueil — Billetterie Officielle Événements & Spectacles",
+    description: "Réservez vos places officielles pour les plus grands concerts, opéras et événements culturels à Madagascar. E-billets sécurisés par QR Code cryptographique.",
+    url: "https://itix.mg/",
+    schema: {
+      "@context": "https://schema.org",
+      "@type": "Organization",
+      "name": "ITIX",
+      "url": "https://itix.mg",
+      "logo": "https://itix.mg/logo.png",
+      "description": "Plateforme officielle de billetterie d'exception pour concerts et événements culturels à Madagascar.",
+    },
+  });
 
   useEffect(() => {
     api
@@ -185,6 +200,18 @@ export default function Home() {
                 {/* Card Details with ticket-inspired dashed line */}
                 <div className="p-5 flex flex-col justify-between flex-1 space-y-4">
                   <div>
+                    {c.organizer_name && (
+                      <div className="mb-1.5">
+                        <Link
+                          to={`/organisateurs/${c.organizer_slug || "itix"}`}
+                          onClick={(e) => e.stopPropagation()}
+                          className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#641C2D] hover:underline"
+                        >
+                          <span>Par {c.organizer_name}</span>
+                        </Link>
+                      </div>
+                    )}
+
                     <h3 className="font-serif text-lg font-bold text-[#111111] group-hover:text-[#641C2D] line-clamp-2 leading-snug">
                       {c.name}
                     </h3>

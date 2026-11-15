@@ -26,6 +26,7 @@ import {
 } from "../../components/ui";
 import type { Concert } from "../../types";
 import { formatAr, formatDate, formatTime } from "../../utils/format";
+import { usePageSeo } from "../../utils/seo";
 
 const MAX_MB = 4;
 
@@ -37,11 +38,62 @@ export default function ConcertPage() {
   const [loadError, setLoadError] = useState("");
   const [instructions, setInstructions] = useState("");
 
+  const pageSchema = useMemo(() => {
+    if (!concert) return undefined;
+    return {
+      "@context": "https://schema.org",
+      "@type": "Event",
+      name: concert.name,
+      description: concert.description || `Concert ${concert.name} au ${concert.venue}`,
+      startDate: concert.date,
+      eventStatus: concert.status === "FINISHED" ? "https://schema.org/EventCompleted" : "https://schema.org/EventScheduled",
+      eventAttendanceMode: "https://schema.org/OfflineEventAttendanceMode",
+      location: {
+        "@type": "Place",
+        name: concert.venue,
+        address: {
+          "@type": "PostalAddress",
+          addressLocality: "Antananarivo",
+          addressCountry: "MG",
+        },
+      },
+      image: [concert.poster_url || "https://itix.mg/logo.png"],
+      organizer: {
+        "@type": "Organization",
+        name: concert.organizer_name || "ITIX",
+        url: concert.organizer_slug ? `https://itix.mg/organisateurs/${concert.organizer_slug}` : "https://itix.mg",
+      },
+      offers: concert.ticket_types.map((tt) => ({
+        "@type": "Offer",
+        name: tt.name,
+        price: tt.price,
+        priceCurrency: "MGA",
+        availability:
+          tt.remaining > 0
+            ? "https://schema.org/InStock"
+            : "https://schema.org/SoldOut",
+        url: `https://itix.mg/concerts/${concert.id}`,
+      })),
+    };
+  }, [concert]);
+
+  usePageSeo({
+    title: concert ? `${concert.name} — Billetterie` : "Concert",
+    description: concert?.description
+      ? concert.description.slice(0, 160)
+      : "Réservez vos places officielles pour cet événement d'exception sur ITIX.",
+    image: concert?.poster_url || "https://itix.mg/logo.png",
+    url: concert ? `https://itix.mg/concerts/${concert.id}` : undefined,
+    schema: pageSchema,
+  });
+
   const [name, setName] = useState(clientUser?.name || "");
   const [email, setEmail] = useState(clientUser?.email || "");
   const [typeId, setTypeId] = useState<number | "">("");
   const [qty, setQty] = useState(1);
   const [mode, setMode] = useState<"PAY_NOW" | "RESERVE">("RESERVE");
+  const [consentCguCgv, setConsentCguCgv] = useState(false);
+  const [consentPrivacy, setConsentPrivacy] = useState(false);
   const [proof, setProof] = useState<File | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -105,6 +157,8 @@ export default function ConcertPage() {
     if (!type) return setError("Choisissez un type de billet.");
     if (mode === "PAY_NOW" && !proof)
       return setError("Ajoutez la capture de votre transaction.");
+    if (!consentCguCgv || !consentPrivacy)
+      return setError("Veuillez accepter les CGV, CGU et la Politique de Confidentialité pour valider votre commande.");
     const fd = new FormData();
     fd.append("concert_id", String(concert.id));
     fd.append("ticket_type_id", String(type.id));
@@ -112,6 +166,8 @@ export default function ConcertPage() {
     fd.append("customer_name", name);
     fd.append("customer_email", email);
     fd.append("pay_mode", mode);
+    fd.append("consent_cgu_cgv", "true");
+    fd.append("consent_privacy", "true");
     if (mode === "PAY_NOW" && proof) fd.append("proof", proof);
     setBusy(true);
     try {
@@ -171,6 +227,20 @@ export default function ConcertPage() {
               Informations Pratiques
             </h3>
             <div className="space-y-3 text-xs text-[#303030]">
+              <div className="flex items-start gap-3">
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#FAF9F6] border border-[#ECEAE6] shrink-0">
+                  <Building2 className="h-4 w-4 text-[#641C2D]" />
+                </div>
+                <div>
+                  <span className="font-semibold text-[#111111] block">Organisateur officiel</span>
+                  <Link
+                    to={`/organisateurs/${concert.organizer_slug || "itix"}`}
+                    className="text-[#641C2D] font-semibold hover:underline inline-flex items-center gap-1"
+                  >
+                    <span>{concert.organizer_name || "ITIX Events"}</span>
+                  </Link>
+                </div>
+              </div>
               <div className="flex items-start gap-3">
                 <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#FAF9F6] border border-[#ECEAE6] shrink-0">
                   <Calendar className="h-4 w-4 text-[#641C2D]" />
@@ -420,6 +490,59 @@ export default function ConcertPage() {
                   )}
                 </div>
               )}
+
+              {/* Legal & RGPD / CMIL Consents */}
+              <div className="space-y-3 pt-3 border-t border-[#ECEAE6] text-xs">
+                <label className="flex items-start gap-2.5 cursor-pointer text-[#444444]">
+                  <input
+                    type="checkbox"
+                    required
+                    checked={consentCguCgv}
+                    onChange={(e) => setConsentCguCgv(e.target.checked)}
+                    className="mt-0.5 rounded border-[#DCD9D3] text-[#641C2D] focus:ring-[#641C2D]"
+                  />
+                  <span className="leading-relaxed">
+                    J'ai lu et j'accepte expressément les{" "}
+                    <Link
+                      to="/conditions-generales-de-vente"
+                      target="_blank"
+                      className="text-[#641C2D] underline font-semibold"
+                    >
+                      Conditions Générales de Vente (CGV)
+                    </Link>{" "}
+                    et les{" "}
+                    <Link
+                      to="/conditions-generales-d-utilisation"
+                      target="_blank"
+                      className="text-[#641C2D] underline font-semibold"
+                    >
+                      CGU
+                    </Link>
+                    .
+                  </span>
+                </label>
+
+                <label className="flex items-start gap-2.5 cursor-pointer text-[#444444]">
+                  <input
+                    type="checkbox"
+                    required
+                    checked={consentPrivacy}
+                    onChange={(e) => setConsentPrivacy(e.target.checked)}
+                    className="mt-0.5 rounded border-[#DCD9D3] text-[#641C2D] focus:ring-[#641C2D]"
+                  />
+                  <span className="leading-relaxed">
+                    J'accepte le traitement de mes coordonnées pour l'émission des billets conformément à la{" "}
+                    <Link
+                      to="/politique-de-confidentialite"
+                      target="_blank"
+                      className="text-[#641C2D] underline font-semibold"
+                    >
+                      Politique de Confidentialité
+                    </Link>{" "}
+                    (conforme RGPD & Loi n° 2014-038 CMIL Madagascar).
+                  </span>
+                </label>
+              </div>
 
               <ErrorBox message={error} />
 

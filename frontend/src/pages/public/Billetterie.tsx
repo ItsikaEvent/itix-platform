@@ -11,10 +11,17 @@ import { api, errorMessage, fileUrl } from "../../api/client";
 import { Badge, CONCERT_STATUS, ErrorBox, Spinner } from "../../components/ui";
 import type { Concert } from "../../types";
 import { formatAr, formatDate, formatTime } from "../../utils/format";
+import { usePageSeo } from "../../utils/seo";
 
 export default function Billetterie() {
   const [concerts, setConcerts] = useState<Concert[] | null>(null);
   const [error, setError] = useState("");
+
+  usePageSeo({
+    title: "Billetterie & Événements",
+    description: "Consultez le programme complet et réservez vos places en ligne pour les prochains concerts et spectacles culturels à Madagascar.",
+    url: "https://itix.mg/billetterie",
+  });
 
   useEffect(() => {
     api
@@ -98,6 +105,18 @@ export default function Billetterie() {
               {/* Card Details */}
               <div className="p-5 flex flex-col justify-between flex-1 space-y-4">
                 <div>
+                  {c.organizer_name && (
+                    <div className="mb-1.5">
+                      <Link
+                        to={`/organisateurs/${c.organizer_slug || "itix"}`}
+                        onClick={(e) => e.stopPropagation()}
+                        className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#641C2D] hover:underline"
+                      >
+                        <span>Par {c.organizer_name}</span>
+                      </Link>
+                    </div>
+                  )}
+
                   <h3 className="font-serif text-lg font-bold text-[#111111] group-hover:text-[#641C2D] line-clamp-2 leading-snug">
                     {c.name}
                   </h3>
