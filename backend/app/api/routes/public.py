@@ -8,15 +8,19 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_current_client
 from app.core.config import get_settings
+from app.core.security import create_client_token
 from app.core.timeutil import local_now
 from app.db.session import get_db
-from app.models.entities import (Admin, ChatMessage, Concert, Order,
+from app.models.entities import (Admin, ChatMessage, ClientAccount, Concert, Order,
                                  StoredFile, SupportMessage, TicketType)
 from app.services.files import save_image
 from app.services.mailer import send_tickets_email, smtp_configured
 from app.services.presenters import concert_out, sold_map
 from app.services.tickets import ticket_images
+from app.services.totp import (generate_totp_secret, get_totp_qr_base64,
+                              get_totp_uri, verify_totp)
 
 router = APIRouter(prefix="/api", tags=["public"])
 
@@ -133,6 +137,14 @@ def create_order(
         payment_status="PROOF_SUBMITTED" if proof_file else "UNPAID",
     )
     db.add(order)
+    clean_cust_email = str(customer_email).lower().strip()
+    if not db.scalar(select(ClientAccount.id).where(ClientAccount.email == clean_cust_email)):
+        db.add(ClientAccount(
+            email=clean_cust_email,
+            name=customer_name.strip(),
+            totp_secret=generate_totp_secret(),
+            is_verified=False,
+        ))
     db.commit()
     return {
         "reference": order.reference,
@@ -143,12 +155,112 @@ def create_order(
     }
 
 
-# ------------------------------------------------------------------ Espace Client & Mes Billets
+# ------------------------------------------------------------------ Authentification Client TOTP (RFC 6238)
+class ClientAuthCheckIn(BaseModel):
+    email: EmailStr
+
+
+class ClientAuthSetupIn(BaseModel):
+    email: EmailStr
+    name: str = Field(..., min_length=2, max_length=120)
+
+
+class ClientAuthVerifyIn(BaseModel):
+    email: EmailStr
+    code: str = Field(..., min_length=6, max_length=6)
+
+
+@router.post("/client/auth/check")
+def check_client_auth(body: ClientAuthCheckIn, db: Session = Depends(get_db)):
+    clean_email = str(body.email).strip().lower()
+    acc = db.scalar(select(ClientAccount).where(ClientAccount.email == clean_email))
+    if acc:
+        return {
+            "has_account": True,
+            "is_verified": acc.is_verified,
+            "name": acc.name,
+        }
+    last_order = db.scalar(
+        select(Order).where(Order.customer_email == clean_email).order_by(Order.id.desc())
+    )
+    return {
+        "has_account": False,
+        "is_verified": False,
+        "name": last_order.customer_name if last_order else "",
+        "has_orders": bool(last_order),
+    }
+
+
+@router.post("/client/auth/setup")
+def setup_client_totp(body: ClientAuthSetupIn, db: Session = Depends(get_db)):
+    clean_email = str(body.email).strip().lower()
+    acc = db.scalar(select(ClientAccount).where(ClientAccount.email == clean_email))
+    if acc and acc.is_verified:
+        raise HTTPException(
+            400,
+            "Votre compte est déjà associé à une application d'authentification. Veuillez saisir votre code TOTP.",
+        )
+
+    secret = generate_totp_secret()
+    if not acc:
+        acc = ClientAccount(
+            email=clean_email,
+            name=body.name.strip(),
+            totp_secret=secret,
+            is_verified=False,
+        )
+        db.add(acc)
+    else:
+        acc.name = body.name.strip()
+        acc.totp_secret = secret
+        acc.is_verified = False
+
+    db.commit()
+    uri = get_totp_uri(clean_email, secret)
+    qr_code = get_totp_qr_base64(uri)
+    return {
+        "email": clean_email,
+        "secret": secret,
+        "uri": uri,
+        "qr_code": qr_code,
+        "message": "Scannez ce QR Code dans votre application d'authentification (Google Authenticator, Microsoft Authenticator, FreeOTP) puis saisissez le code à 6 chiffres.",
+    }
+
+
+@router.post("/client/auth/verify")
+def verify_client_totp(body: ClientAuthVerifyIn, db: Session = Depends(get_db)):
+    clean_email = str(body.email).strip().lower()
+    acc = db.scalar(select(ClientAccount).where(ClientAccount.email == clean_email))
+    if not acc:
+        raise HTTPException(404, "Aucun compte client trouvé pour cette adresse e-mail.")
+
+    if not verify_totp(acc.totp_secret, body.code):
+        raise HTTPException(
+            401,
+            "Code d'accès invalide ou expiré. Assurez-vous que l'heure de votre téléphone est synchronisée.",
+        )
+
+    acc.is_verified = True
+    db.commit()
+
+    token = create_client_token(acc.email, acc.name)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "email": acc.email,
+            "name": acc.name,
+        },
+    }
+
+
+# ------------------------------------------------------------------ Espace Client & Mes Billets (Sécurisé TOTP)
 @router.get("/client/orders")
-def get_client_orders(email: str, db: Session = Depends(get_db)):
-    clean_email = email.strip().lower()
-    if not clean_email:
-        raise HTTPException(400, "Adresse e-mail requise.")
+def get_client_orders(
+    client: dict = Depends(get_current_client),
+    db: Session = Depends(get_db),
+):
+    clean_email = client["sub"]
 
     orders = db.scalars(
         select(Order)
@@ -195,8 +307,13 @@ def get_client_orders(email: str, db: Session = Depends(get_db)):
 
 
 @router.post("/client/orders/{order_id}/resend-email")
-def client_resend_email(order_id: int, email: str, bg: BackgroundTasks, db: Session = Depends(get_db)):
-    clean_email = email.strip().lower()
+def client_resend_email(
+    order_id: int,
+    bg: BackgroundTasks,
+    client: dict = Depends(get_current_client),
+    db: Session = Depends(get_db),
+):
+    clean_email = client["sub"]
     o = db.scalar(select(Order).where(Order.id == order_id, Order.customer_email == clean_email))
     if not o:
         raise HTTPException(404, "Commande introuvable pour cette adresse e-mail.")
@@ -294,17 +411,18 @@ def list_client_messages(email: str, db: Session = Depends(get_db)):
 
 # ------------------------------------------------------------------ Messagerie Instantanée (Chat)
 class ChatMessageIn(BaseModel):
-    customer_email: EmailStr
-    customer_name: str = Field(..., min_length=2, max_length=120)
+    customer_email: EmailStr | None = None
+    customer_name: str | None = None
     concert_id: int | None = None
     message: str = Field(..., min_length=1, max_length=2000)
 
 
 @router.get("/client/chat")
-def get_chat_history(email: str, db: Session = Depends(get_db)):
-    clean_email = email.strip().lower()
-    if not clean_email:
-        raise HTTPException(400, "Adresse e-mail requise.")
+def get_chat_history(
+    client: dict = Depends(get_current_client),
+    db: Session = Depends(get_db),
+):
+    clean_email = client["sub"]
 
     messages = db.scalars(
         select(ChatMessage)
@@ -326,7 +444,14 @@ def get_chat_history(email: str, db: Session = Depends(get_db)):
 
 
 @router.post("/client/chat", status_code=201)
-def post_chat_message(body: ChatMessageIn, db: Session = Depends(get_db)):
+def post_chat_message(
+    body: ChatMessageIn,
+    client: dict = Depends(get_current_client),
+    db: Session = Depends(get_db),
+):
+    clean_email = client["sub"]
+    cust_name = client.get("name") or body.customer_name or "Client"
+
     effective_org_id = None
     if body.concert_id:
         c = db.get(Concert, body.concert_id)
@@ -334,8 +459,8 @@ def post_chat_message(body: ChatMessageIn, db: Session = Depends(get_db)):
             effective_org_id = c.organizer_id
 
     msg = ChatMessage(
-        customer_email=str(body.customer_email).lower().strip(),
-        customer_name=body.customer_name.strip(),
+        customer_email=clean_email,
+        customer_name=cust_name,
         concert_id=body.concert_id,
         organizer_id=effective_org_id,
         sender="CLIENT",

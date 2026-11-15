@@ -34,9 +34,7 @@ export default function MyTickets() {
     setLoading(true);
     setError("");
     try {
-      const { data } = await api.get<{ orders: ClientOrder[] }>("/api/client/orders", {
-        params: { email: clientUser.email },
-      });
+      const { data } = await api.get<{ orders: ClientOrder[] }>("/api/client/orders");
       setOrders(data.orders);
     } catch (e) {
       setError(errorMessage(e));
@@ -58,9 +56,7 @@ export default function MyTickets() {
     setResendSuccess(null);
     try {
       const { data } = await api.post<{ message: string }>(
-        `/api/client/orders/${orderId}/resend-email`,
-        null,
-        { params: { email: clientUser.email } }
+        `/api/client/orders/${orderId}/resend-email`
       );
       setResendSuccess(data.message || "E-mail renvoyé avec succès !");
     } catch (e) {

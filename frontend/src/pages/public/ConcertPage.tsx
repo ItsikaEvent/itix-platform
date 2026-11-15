@@ -33,7 +33,7 @@ const MAX_MB = 4;
 export default function ConcertPage() {
   const { id } = useParams();
   const nav = useNavigate();
-  const { clientUser, loginClient } = useClientAuth();
+  const { clientUser } = useClientAuth();
   const [concert, setConcert] = useState<Concert | null>(null);
   const [loadError, setLoadError] = useState("");
   const [instructions, setInstructions] = useState("");
@@ -172,7 +172,6 @@ export default function ConcertPage() {
     setBusy(true);
     try {
       const { data } = await api.post("/api/orders", fd);
-      loginClient(name, email);
       setDone({
         quantity: data.quantity,
         email: data.customer_email,

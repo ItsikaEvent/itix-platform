@@ -37,6 +37,26 @@ def decode_access_token(token: str) -> str | None:
         return None
 
 
+def create_client_token(email: str, name: str) -> str:
+    s = get_settings()
+    exp = datetime.now(timezone.utc) + timedelta(minutes=s.jwt_expire_minutes)
+    return jwt.encode(
+        {"sub": email.strip().lower(), "name": name, "role": "client", "exp": exp},
+        s.jwt_secret,
+        algorithm="HS256",
+    )
+
+
+def decode_client_token(token: str) -> dict | None:
+    try:
+        payload = jwt.decode(token, get_settings().jwt_secret, algorithms=["HS256"])
+        if payload.get("role") != "client":
+            return None
+        return payload
+    except (jwt.PyJWTError, KeyError):
+        return None
+
+
 # ---------------------------------------------------------------- QR Codes
 # Le contenu du QR est un jeton Fernet (AES-128-CBC + HMAC-SHA256) : illisible sans la
 # clé du serveur, infalsifiable, et différent à chaque génération.

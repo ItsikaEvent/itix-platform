@@ -7,6 +7,7 @@ from app.core.security import decrypt_ticket, encrypt_ticket
 from app.db.session import SessionLocal
 from app.main import app
 from app.models.entities import Ticket
+from app.services.totp import get_totp_token
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 64
 
@@ -205,3 +206,46 @@ def test_multi_organizer_isolation_and_flow(client, auth):
     # Le 1er organisateur scanne son propre billet -> VALIDE
     scan_ok = client.post("/api/admin/scan", headers=org_auth, json={"token": org_token_qr}).json()
     assert scan_ok["result"] == "VALID"
+
+
+def test_client_totp_authenticator_flow(client):
+    email = "spectateur.securise@example.com"
+    name = "Spectateur Sécurisé"
+
+    # 1. Tentative d'accès sans token TOTP -> Refus 401
+    r_unauth = client.get("/api/client/orders")
+    assert r_unauth.status_code == 401
+
+    # 2. Vérification existence compte -> non configuré
+    r_check = client.post("/api/client/auth/check", json={"email": email})
+    assert r_check.status_code == 200
+    assert r_check.json()["has_account"] is False
+
+    # 3. Setup TOTP -> Génération du secret et du QR code pour Google Authenticator
+    r_setup = client.post("/api/client/auth/setup", json={"email": email, "name": name})
+    assert r_setup.status_code == 200
+    setup_data = r_setup.json()
+    assert "secret" in setup_data
+    assert "qr_code" in setup_data
+    assert setup_data["qr_code"].startswith("data:image/png;base64,")
+    secret = setup_data["secret"]
+
+    # 4. Tentative avec mauvais code -> Refus 401
+    r_bad_code = client.post("/api/client/auth/verify", json={"email": email, "code": "000000"})
+    assert r_bad_code.status_code == 401
+
+    # 5. Calcul du code valide via l'application d'authentification
+    valid_code = get_totp_token(secret)
+    r_verify = client.post("/api/client/auth/verify", json={"email": email, "code": valid_code})
+    assert r_verify.status_code == 200
+    verify_data = r_verify.json()
+    assert "access_token" in verify_data
+    client_token = verify_data["access_token"]
+    assert verify_data["user"]["email"] == email
+
+    # 6. Accès autorisé à /api/client/orders avec le token Bearer TOTP
+    client_auth = {"Authorization": f"Bearer {client_token}"}
+    r_orders = client.get("/api/client/orders", headers=client_auth)
+    assert r_orders.status_code == 200
+    assert "orders" in r_orders.json()
+
