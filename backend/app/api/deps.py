@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.core.security import decode_access_token, decode_client_token
 from app.db.session import get_db
-from app.models.entities import Admin, ROLE_SUPER_ADMIN
+from app.models.entities import Admin, ROLE_SUPER_ADMIN, ROLE_ORGANIZER, ROLE_STAFF_SCANNER
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -28,14 +28,30 @@ def require_super_admin(current: Admin = Depends(get_current_admin)) -> Admin:
     return current
 
 
+def require_admin_or_organizer(current: Admin = Depends(get_current_admin)) -> Admin:
+    if current.role not in (ROLE_SUPER_ADMIN, ROLE_ORGANIZER):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Accès refusé : cette action est réservée aux organisateurs et administrateurs.",
+        )
+    return current
+
+
+def require_scanner_access(current: Admin = Depends(get_current_admin)) -> Admin:
+    if current.role not in (ROLE_SUPER_ADMIN, ROLE_ORGANIZER, ROLE_STAFF_SCANNER):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Accès refusé au poste de contrôle.")
+    return current
+
+
 def get_current_client(
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> dict:
     if not creds:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Accès sécurisé : veuillez vous authentifier avec votre code TOTP.")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Accès sécurisé : veuillez vous identifier.")
     payload = decode_client_token(creds.credentials)
     if not payload:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Session expirée ou code d'accès invalide.")
     return payload
+
 
 

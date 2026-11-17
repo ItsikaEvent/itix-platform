@@ -4,11 +4,24 @@ import type { AdminUser } from "../types";
 
 const USER_KEY = "itix_admin_user";
 
+export interface LoginResult {
+  requires_totp_setup?: boolean;
+  requires_totp?: boolean;
+  setup_token?: string;
+  auth_token?: string;
+  qr_code?: string;
+  secret?: string;
+  email?: string;
+  must_change_password?: boolean;
+  role?: string;
+}
+
 interface AuthContextType {
   user: AdminUser | null;
   isAuth: boolean;
   isSuperAdmin: boolean;
-  login: (email: string, password: string) => Promise<{ must_change_password: boolean }>;
+  login: (email: string, password: string) => Promise<LoginResult>;
+  verifyTotp: (token: string, code: string) => Promise<{ must_change_password: boolean; role?: string }>;
   logout: () => void;
   changePassword: (newPassword: string, oldPassword?: string) => Promise<void>;
   refreshUser: () => Promise<void>;
@@ -45,15 +58,33 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [token]);
 
-  const login = async (email: string, password: string) => {
+  const login = async (email: string, password: string): Promise<LoginResult> => {
     const { data } = await api.post("/api/auth/login", { email, password });
+    if (data.requires_totp_setup || data.requires_totp) {
+      return data as LoginResult;
+    }
+
     localStorage.setItem(TOKEN_KEY, data.access_token);
     setToken(data.access_token);
 
     if (data.user) {
       localStorage.setItem(USER_KEY, JSON.stringify(data.user));
       setUser(data.user);
-      return { must_change_password: data.user.must_change_password };
+      return { must_change_password: data.user.must_change_password, role: data.user.role };
+    }
+    await refreshUser();
+    return { must_change_password: false };
+  };
+
+  const verifyTotp = async (tokenStr: string, code: string) => {
+    const { data } = await api.post("/api/auth/verify-totp", { token: tokenStr, code });
+    localStorage.setItem(TOKEN_KEY, data.access_token);
+    setToken(data.access_token);
+
+    if (data.user) {
+      localStorage.setItem(USER_KEY, JSON.stringify(data.user));
+      setUser(data.user);
+      return { must_change_password: data.user.must_change_password, role: data.user.role };
     }
     await refreshUser();
     return { must_change_password: false };
@@ -85,6 +116,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         isAuth: !!token,
         isSuperAdmin: user?.role === "SUPER_ADMIN",
         login,
+        verifyTotp,
         logout,
         changePassword,
         refreshUser,

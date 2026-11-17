@@ -37,6 +37,36 @@ def decode_access_token(token: str) -> str | None:
         return None
 
 
+def create_admin_2fa_pending_token(admin_id: int) -> str:
+    s = get_settings()
+    exp = datetime.now(timezone.utc) + timedelta(minutes=5)
+    return jwt.encode(
+        {"sub": str(admin_id), "scope": "2fa_pending", "exp": exp},
+        s.jwt_secret,
+        algorithm="HS256",
+    )
+
+
+def create_admin_2fa_setup_token(admin_id: int, secret: str) -> str:
+    s = get_settings()
+    exp = datetime.now(timezone.utc) + timedelta(minutes=10)
+    return jwt.encode(
+        {"sub": str(admin_id), "secret": secret, "scope": "2fa_setup", "exp": exp},
+        s.jwt_secret,
+        algorithm="HS256",
+    )
+
+
+def decode_admin_2fa_token(token: str) -> dict | None:
+    try:
+        payload = jwt.decode(token, get_settings().jwt_secret, algorithms=["HS256"])
+        if payload.get("scope") not in ("2fa_pending", "2fa_setup"):
+            return None
+        return payload
+    except (jwt.PyJWTError, KeyError):
+        return None
+
+
 def create_client_token(email: str, name: str) -> str:
     s = get_settings()
     exp = datetime.now(timezone.utc) + timedelta(minutes=s.jwt_expire_minutes)

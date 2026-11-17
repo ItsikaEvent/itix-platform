@@ -4,6 +4,7 @@ import { CLIENT_TOKEN_KEY, CLIENT_USER_KEY } from "../api/client";
 export interface ClientUser {
   email: string;
   name: string;
+  totp_enabled?: boolean;
 }
 
 interface ClientAuthContextType {

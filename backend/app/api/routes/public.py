@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_client
 from app.core.config import get_settings
+from app.core.limiter import rate_limit
 from app.core.security import create_client_token
 from app.core.timeutil import local_now
 from app.db.session import get_db
@@ -85,7 +86,11 @@ def _new_reference(db: Session) -> str:
             return ref
 
 
-@router.post("/orders", status_code=201)
+@router.post(
+    "/orders",
+    status_code=201,
+    dependencies=[Depends(rate_limit(max_requests=25, window_seconds=60, key_prefix="orders"))],
+)
 def create_order(
     concert_id: int = Form(...),
     ticket_type_id: int = Form(...),
@@ -155,9 +160,14 @@ def create_order(
     }
 
 
-# ------------------------------------------------------------------ Authentification Client TOTP (RFC 6238)
+# ------------------------------------------------------------------ Authentification Client (2FA Optionnel)
 class ClientAuthCheckIn(BaseModel):
     email: EmailStr
+
+
+class ClientAuthSimpleIn(BaseModel):
+    email: EmailStr
+    name: str | None = None
 
 
 class ClientAuthSetupIn(BaseModel):
@@ -170,6 +180,10 @@ class ClientAuthVerifyIn(BaseModel):
     code: str = Field(..., min_length=6, max_length=6)
 
 
+class Confirm2FaIn(BaseModel):
+    code: str = Field(..., min_length=6, max_length=6)
+
+
 @router.post("/client/auth/check")
 def check_client_auth(body: ClientAuthCheckIn, db: Session = Depends(get_db)):
     clean_email = str(body.email).strip().lower()
@@ -177,6 +191,7 @@ def check_client_auth(body: ClientAuthCheckIn, db: Session = Depends(get_db)):
     if acc:
         return {
             "has_account": True,
+            "totp_enabled": acc.totp_enabled,
             "is_verified": acc.is_verified,
             "name": acc.name,
         }
@@ -185,17 +200,118 @@ def check_client_auth(body: ClientAuthCheckIn, db: Session = Depends(get_db)):
     )
     return {
         "has_account": False,
+        "totp_enabled": False,
         "is_verified": False,
         "name": last_order.customer_name if last_order else "",
         "has_orders": bool(last_order),
     }
 
 
+@router.post("/client/auth/login-simple")
+def login_simple_client(body: ClientAuthSimpleIn, db: Session = Depends(get_db)):
+    clean_email = str(body.email).strip().lower()
+    acc = db.scalar(select(ClientAccount).where(ClientAccount.email == clean_email))
+    if acc and acc.totp_enabled:
+        raise HTTPException(
+            403,
+            "Ce compte a activé la protection 2FA. Veuillez saisir le code à 6 chiffres de votre application.",
+        )
+
+    if not acc:
+        cust_name = body.name.strip() if body.name else None
+        if not cust_name:
+            last_order = db.scalar(
+                select(Order).where(Order.customer_email == clean_email).order_by(Order.id.desc())
+            )
+            cust_name = last_order.customer_name if last_order else "Spectateur"
+        acc = ClientAccount(
+            email=clean_email,
+            name=cust_name,
+            totp_enabled=False,
+            is_verified=False,
+        )
+        db.add(acc)
+    else:
+        if body.name and body.name.strip():
+            acc.name = body.name.strip()
+    db.commit()
+
+    token = create_client_token(acc.email, acc.name)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "email": acc.email,
+            "name": acc.name,
+            "totp_enabled": False,
+        },
+    }
+
+
+@router.post("/client/auth/enable-2fa")
+def enable_client_2fa(
+    client: dict = Depends(get_current_client),
+    db: Session = Depends(get_db),
+):
+    clean_email = client["sub"]
+    acc = db.scalar(select(ClientAccount).where(ClientAccount.email == clean_email))
+    if not acc:
+        raise HTTPException(404, "Compte introuvable.")
+
+    secret = generate_totp_secret()
+    acc.totp_secret = secret
+    db.commit()
+
+    uri = get_totp_uri(clean_email, secret)
+    qr_code = get_totp_qr_base64(uri)
+    return {
+        "secret": secret,
+        "uri": uri,
+        "qr_code": qr_code,
+        "message": "Scannez ce QR Code dans Google Authenticator ou Microsoft Authenticator.",
+    }
+
+
+@router.post("/client/auth/confirm-enable-2fa")
+def confirm_enable_client_2fa(
+    body: Confirm2FaIn,
+    client: dict = Depends(get_current_client),
+    db: Session = Depends(get_db),
+):
+    clean_email = client["sub"]
+    acc = db.scalar(select(ClientAccount).where(ClientAccount.email == clean_email))
+    if not acc or not acc.totp_secret:
+        raise HTTPException(400, "Veuillez d'abord initialiser l'activation du 2FA.")
+
+    if not verify_totp(acc.totp_secret, body.code):
+        raise HTTPException(401, "Code d'authentification invalide. Vérifiez l'heure de votre appareil.")
+
+    acc.totp_enabled = True
+    acc.is_verified = True
+    db.commit()
+    return {"message": "Protection 2FA activée avec succès sur votre compte.", "totp_enabled": True}
+
+
+@router.post("/client/auth/disable-2fa")
+def disable_client_2fa(
+    client: dict = Depends(get_current_client),
+    db: Session = Depends(get_db),
+):
+    clean_email = client["sub"]
+    acc = db.scalar(select(ClientAccount).where(ClientAccount.email == clean_email))
+    if not acc:
+        raise HTTPException(404, "Compte introuvable.")
+
+    acc.totp_enabled = False
+    db.commit()
+    return {"message": "Protection 2FA désactivée.", "totp_enabled": False}
+
+
 @router.post("/client/auth/setup")
 def setup_client_totp(body: ClientAuthSetupIn, db: Session = Depends(get_db)):
     clean_email = str(body.email).strip().lower()
     acc = db.scalar(select(ClientAccount).where(ClientAccount.email == clean_email))
-    if acc and acc.is_verified:
+    if acc and acc.totp_enabled and acc.is_verified:
         raise HTTPException(
             400,
             "Votre compte est déjà associé à une application d'authentification. Veuillez saisir votre code TOTP.",
@@ -207,13 +323,13 @@ def setup_client_totp(body: ClientAuthSetupIn, db: Session = Depends(get_db)):
             email=clean_email,
             name=body.name.strip(),
             totp_secret=secret,
+            totp_enabled=False,
             is_verified=False,
         )
         db.add(acc)
     else:
         acc.name = body.name.strip()
         acc.totp_secret = secret
-        acc.is_verified = False
 
     db.commit()
     uri = get_totp_uri(clean_email, secret)
@@ -223,7 +339,7 @@ def setup_client_totp(body: ClientAuthSetupIn, db: Session = Depends(get_db)):
         "secret": secret,
         "uri": uri,
         "qr_code": qr_code,
-        "message": "Scannez ce QR Code dans votre application d'authentification (Google Authenticator, Microsoft Authenticator, FreeOTP) puis saisissez le code à 6 chiffres.",
+        "message": "Scannez ce QR Code dans votre application d'authentification puis saisissez le code à 6 chiffres.",
     }
 
 
@@ -231,8 +347,8 @@ def setup_client_totp(body: ClientAuthSetupIn, db: Session = Depends(get_db)):
 def verify_client_totp(body: ClientAuthVerifyIn, db: Session = Depends(get_db)):
     clean_email = str(body.email).strip().lower()
     acc = db.scalar(select(ClientAccount).where(ClientAccount.email == clean_email))
-    if not acc:
-        raise HTTPException(404, "Aucun compte client trouvé pour cette adresse e-mail.")
+    if not acc or not acc.totp_secret:
+        raise HTTPException(404, "Aucun compte client ou secret 2FA trouvé pour cette adresse e-mail.")
 
     if not verify_totp(acc.totp_secret, body.code):
         raise HTTPException(
@@ -240,6 +356,7 @@ def verify_client_totp(body: ClientAuthVerifyIn, db: Session = Depends(get_db)):
             "Code d'accès invalide ou expiré. Assurez-vous que l'heure de votre téléphone est synchronisée.",
         )
 
+    acc.totp_enabled = True
     acc.is_verified = True
     db.commit()
 
@@ -250,6 +367,7 @@ def verify_client_totp(body: ClientAuthVerifyIn, db: Session = Depends(get_db)):
         "user": {
             "email": acc.email,
             "name": acc.name,
+            "totp_enabled": True,
         },
     }
 

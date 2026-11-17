@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import { Ticket, ArrowRight, ArrowLeft, Info, Shield, KeyRound, QrCode, Copy, Check } from "../../components/icons";
+import { Ticket, ArrowRight, ArrowLeft, Shield, KeyRound, Sparkles } from "../../components/icons";
 import { api, errorMessage } from "../../api/client";
 import { useClientAuth } from "../../context/ClientAuthContext";
 import { Button, ErrorBox, inputCls } from "../../components/ui";
@@ -10,7 +10,7 @@ interface ClientLoginProps {
   subtitle?: string;
 }
 
-type AuthStep = "EMAIL" | "SETUP_QR" | "ENTER_CODE";
+type AuthStep = "EMAIL" | "ENTER_CODE";
 
 export default function ClientLogin({
   onSuccess,
@@ -19,22 +19,12 @@ export default function ClientLogin({
 }: ClientLoginProps) {
   const { loginClient } = useClientAuth();
   const [step, setStep] = useState<AuthStep>("EMAIL");
-  const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [code, setCode] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  // Données de configuration TOTP (pour la première configuration)
-  const [setupData, setSetupData] = useState<{
-    secret: string;
-    uri: string;
-    qr_code: string;
-  } | null>(null);
-  const [copied, setCopied] = useState(false);
-
-  // Étape 1 : Vérifier le statut du compte
-  const handleCheckEmail = async (e: FormEvent) => {
+  const handleEmailSubmit = async (e: FormEvent) => {
     e.preventDefault();
     const cleanEmail = email.trim().toLowerCase();
     if (!cleanEmail) return;
@@ -43,46 +33,36 @@ export default function ClientLogin({
     setLoading(true);
 
     try {
-      const { data } = await api.post<{
+      // 1. Vérification du statut A2F du compte
+      const { data: checkData } = await api.post<{
         has_account: boolean;
-        is_verified: boolean;
+        totp_enabled: boolean;
         name: string;
       }>("/api/client/auth/check", { email: cleanEmail });
 
-      if (data.name && !name) {
-        setName(data.name);
+      if (checkData.totp_enabled) {
+        // Le spectateur a activé l'A2F : demander le code à 6 chiffres
+        setStep("ENTER_CODE");
+        setLoading(false);
+        return;
       }
 
-      if (data.has_account && data.is_verified) {
-        // Le compte existe et a déjà été configuré avec Google Authenticator
-        setStep("ENTER_CODE");
-      } else {
-        // Le compte doit configurer son application d'authentification
-        await triggerSetup(cleanEmail, name || data.name || "Spectateur");
-      }
+      // 2. Par défaut : connexion directe et simple avec l'adresse e-mail
+      const { data: loginData } = await api.post<{
+        access_token: string;
+        user: { name: string; email: string; totp_enabled?: boolean };
+      }>("/api/client/auth/login-simple", { email: cleanEmail });
+
+      loginClient(loginData.access_token, loginData.user);
+      onSuccess?.();
     } catch (err) {
-      setError(errorMessage(err, "Impossible de vérifier ce compte."));
+      setError(errorMessage(err, "Impossible de vous connecter. Vérifiez votre adresse e-mail."));
     } finally {
       setLoading(false);
     }
   };
 
-  // Déclencher la génération du QR Code TOTP
-  const triggerSetup = async (targetEmail: string, targetName: string) => {
-    const { data } = await api.post<{
-      secret: string;
-      uri: string;
-      qr_code: string;
-    }>("/api/client/auth/setup", {
-      email: targetEmail,
-      name: targetName || "Spectateur",
-    });
-    setSetupData(data);
-    setStep("SETUP_QR");
-  };
-
-  // Étape 2 ou 3 : Vérifier le code TOTP à 6 chiffres
-  const handleVerifyCode = async (e: FormEvent) => {
+  const handleVerifyTotpSubmit = async (e: FormEvent) => {
     e.preventDefault();
     const cleanCode = code.trim().replace(/\s+/g, "");
     if (cleanCode.length !== 6) {
@@ -96,244 +76,131 @@ export default function ClientLogin({
     try {
       const { data } = await api.post<{
         access_token: string;
-        user: { name: string; email: string };
+        user: { name: string; email: string; totp_enabled?: boolean };
       }>("/api/client/auth/verify", {
         email: email.trim().toLowerCase(),
         code: cleanCode,
       });
 
-      loginClient(data.access_token, data.user);
-      if (onSuccess) onSuccess();
+      loginClient(data.access_token, { ...data.user, totp_enabled: true });
+      onSuccess?.();
     } catch (err) {
-      setError(errorMessage(err, "Code invalide. Vérifiez l'heure de votre appareil."));
+      setError(errorMessage(err, "Code de sécurité incorrect. Vérifiez votre application."));
     } finally {
       setLoading(false);
     }
   };
 
-  const copySecret = () => {
-    if (!setupData?.secret) return;
-    navigator.clipboard.writeText(setupData.secret);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
   return (
-    <div className="mx-auto max-w-md border border-[#ECEAE6] bg-[#FFFFFF] p-6 sm:p-8 rounded-2xl shadow-sm space-y-6">
-      <div className="text-center">
-        <div className="mx-auto flex h-12 w-12 items-center justify-center bg-[#FAF9F6] text-[#641C2D] border border-[#ECEAE6] rounded-xl mb-3">
-          {step === "SETUP_QR" ? (
-            <QrCode className="h-6 w-6 text-[#641C2D]" />
-          ) : step === "ENTER_CODE" ? (
-            <KeyRound className="h-6 w-6 text-[#641C2D]" />
-          ) : (
-            <Ticket className="h-6 w-6 text-[#641C2D]" />
-          )}
+    <div className="w-full max-w-md mx-auto bg-[#181818] border border-[#2A2A2A] p-6 sm:p-8 rounded-none shadow-2xl">
+      {/* En-tête */}
+      <div className="text-center mb-6">
+        <div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-[#641C2D]/20 border border-[#641C2D] text-[#C6A15B] mb-3">
+          {step === "ENTER_CODE" ? <Shield className="w-6 h-6" /> : <Ticket className="w-6 h-6" />}
         </div>
-        <span className="text-[10px] font-semibold uppercase tracking-widest text-[#641C2D] block mb-1">
-          Espace Sécurisé Client
-        </span>
-        <h2 className="font-serif text-2xl font-bold text-[#111111]">
-          {step === "SETUP_QR"
-            ? "Lier votre Authentificateur"
-            : step === "ENTER_CODE"
-            ? "Code d'Accès Sécurisé"
-            : title || "Espace Client ITIX"}
+        <h2 className="font-serif text-2xl font-bold text-[#F7F3EA]">
+          {title || (step === "ENTER_CODE" ? "Vérification en deux étapes" : "Espace Spectateur")}
         </h2>
-        <p className="text-xs text-[#666666] mt-1.5 leading-relaxed">
-          {step === "SETUP_QR"
-            ? "Scannez ce QR Code dans Google Authenticator, Microsoft Authenticator ou FreeOTP."
-            : step === "ENTER_CODE"
-            ? `Entrez le code à 6 chiffres affiché sur votre application pour ${email}.`
-            : subtitle ||
-              "Identifiez-vous pour consulter vos billets et QR Codes certifiés en toute sécurité."}
+        <p className="text-xs text-[#9E9B94] mt-1.5 leading-relaxed">
+          {subtitle ||
+            (step === "ENTER_CODE"
+              ? `Saisissez le code de validation pour ${email}`
+              : "Accédez instantanément à vos billets et réservations avec votre e-mail.")}
         </p>
       </div>
 
       <ErrorBox message={error} />
 
-      {/* Étape 1 : Saisie de l'e-mail */}
+      {/* Étape 1 : Connexion simple par e-mail */}
       {step === "EMAIL" && (
-        <form onSubmit={handleCheckEmail} className="space-y-4">
+        <form onSubmit={handleEmailSubmit} className="space-y-4">
           <div>
-            <label className="block text-xs font-semibold text-[#555555] uppercase tracking-wider mb-1.5">
-              Votre Prénom / Nom
-            </label>
-            <input
-              type="text"
-              required
-              placeholder="Ex: Jean Dupont"
-              className={inputCls}
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-            />
-          </div>
-
-          <div>
-            <label className="block text-xs font-semibold text-[#555555] uppercase tracking-wider mb-1.5">
-              Votre adresse e-mail
+            <label className="block text-xs font-semibold text-[#9E9B94] uppercase tracking-wider mb-1.5">
+              Adresse e-mail
             </label>
             <input
               type="email"
-              required
-              placeholder="jean@example.com"
               className={inputCls}
+              placeholder="votre.email@exemple.mg"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-            />
-            <p className="text-[11px] text-[#777777] mt-1.5 flex items-center gap-1.5">
-              <Info className="h-3 w-3 text-[#641C2D] shrink-0" />
-              <span>Indiquez l'e-mail utilisé lors de votre réservation de billets.</span>
-            </p>
-          </div>
-
-          <div className="pt-2">
-            <Button
-              type="submit"
-              disabled={loading || !email.trim() || !name.trim()}
-              className="w-full justify-center py-2.5 text-xs font-semibold"
-            >
-              <span>{loading ? "Vérification…" : "Continuer"}</span>
-              <ArrowRight className="h-3.5 w-3.5" />
-            </Button>
-          </div>
-        </form>
-      )}
-
-      {/* Étape 2 : Configuration QR Code TOTP */}
-      {step === "SETUP_QR" && setupData && (
-        <form onSubmit={handleVerifyCode} className="space-y-5 animate-in fade-in duration-200">
-          <div className="rounded-xl border border-[#ECEAE6] bg-[#FAF9F6] p-4 text-center space-y-3">
-            <div className="mx-auto w-48 h-48 bg-white p-2 rounded-lg border border-[#ECEAE6] shadow-sm flex items-center justify-center">
-              <img
-                src={setupData.qr_code}
-                alt="QR Code d'authentification Google Authenticator"
-                className="w-full h-full object-contain"
-              />
-            </div>
-            <div className="space-y-1">
-              <p className="text-xs font-semibold text-[#111111]">
-                Application d'authentification compatible :
-              </p>
-              <p className="text-[11px] text-[#666666]">
-                Google Authenticator, Microsoft Authenticator, FreeOTP ou Apple Keychain.
-              </p>
-            </div>
-
-            {/* Secret Manuel */}
-            <div className="pt-2 border-t border-[#ECEAE6] flex items-center justify-between text-[11px]">
-              <span className="text-[#666666] font-mono truncate max-w-[200px]">
-                Clé : {setupData.secret}
-              </span>
-              <button
-                type="button"
-                onClick={copySecret}
-                className="inline-flex items-center gap-1 text-[#641C2D] hover:underline font-semibold"
-              >
-                {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
-                <span>{copied ? "Copié !" : "Copier"}</span>
-              </button>
-            </div>
-          </div>
-
-          <div>
-            <label className="block text-xs font-semibold text-[#555555] uppercase tracking-wider mb-1.5 text-center">
-              Code à 6 chiffres affiché sur l'application
-            </label>
-            <input
-              type="text"
-              inputMode="numeric"
-              pattern="[0-9]*"
-              maxLength={6}
               required
               autoFocus
-              placeholder="123456"
-              className={`${inputCls} text-center tracking-[0.35em] text-lg font-mono font-bold`}
-              value={code}
-              onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
             />
           </div>
 
-          <div className="space-y-2 pt-2">
-            <Button
-              type="submit"
-              disabled={loading || code.trim().length !== 6}
-              className="w-full justify-center py-2.5 text-xs font-semibold"
-            >
-              <Shield className="h-3.5 w-3.5 mr-1" />
-              <span>{loading ? "Validation en cours…" : "Valider et ouvrir mes billets"}</span>
-            </Button>
-
-            <button
-              type="button"
-              onClick={() => {
-                setStep("EMAIL");
-                setCode("");
-                setError("");
-              }}
-              className="w-full text-center text-xs text-[#666666] hover:text-[#111111] py-1 flex items-center justify-center gap-1"
-            >
-              <ArrowLeft className="h-3 w-3" />
-              <span>Changer d'adresse e-mail</span>
-            </button>
+          <div className="bg-[#222222] border border-[#333333] p-3 text-[11px] text-[#A8A49E] flex items-start gap-2.5">
+            <Sparkles className="w-4 h-4 text-[#C6A15B] shrink-0 mt-0.5" />
+            <span>
+              Accès simplifié sans mot de passe complexe. Vous pourrez optionnellement activer la protection A2F dans votre espace.
+            </span>
           </div>
+
+          <Button
+            type="submit"
+            variant="primary"
+            className="w-full flex items-center justify-center gap-2 cursor-pointer py-3 text-sm"
+            disabled={loading}
+          >
+            <span>{loading ? "Vérification…" : "Accéder à mes billets"}</span>
+            <ArrowRight className="w-4 h-4" />
+          </Button>
         </form>
       )}
 
-      {/* Étape 3 : Saisie directe du code TOTP */}
+      {/* Étape 2 : Vérification TOTP (si le client a activé l'A2F) */}
       {step === "ENTER_CODE" && (
-        <form onSubmit={handleVerifyCode} className="space-y-5 animate-in fade-in duration-200">
-          <div className="rounded-xl border border-[#ECEAE6] bg-[#FAF9F6] p-4 text-center space-y-2">
-            <div className="flex items-center justify-center gap-2 text-xs font-semibold text-[#111111]">
-              <Shield className="h-4 w-4 text-[#641C2D]" />
-              <span>Protection 2FA Active</span>
+        <form onSubmit={handleVerifyTotpSubmit} className="space-y-5">
+          <div className="bg-[#222222] border border-[#333333] p-3 text-xs text-[#C6A15B] flex items-start gap-2.5">
+            <KeyRound className="w-4 h-4 shrink-0 mt-0.5" />
+            <div>
+              <p className="font-semibold text-white">Protection A2F active</p>
+              <p className="text-[11px] text-[#A8A49E] mt-0.5">
+                Ouvrez votre application (Google Authenticator) et saisissez le code temporaire.
+              </p>
             </div>
-            <p className="text-[11px] text-[#666666]">
-              Ouvrez votre application d'authentification mobile et saisissez le code actuel pour <strong>{email}</strong>.
-            </p>
           </div>
 
           <div>
-            <label className="block text-xs font-semibold text-[#555555] uppercase tracking-wider mb-1.5 text-center">
+            <label className="block text-xs font-semibold text-[#9E9B94] uppercase tracking-wider mb-2 text-center">
               Code à 6 chiffres
             </label>
             <input
               type="text"
               inputMode="numeric"
-              pattern="[0-9]*"
+              pattern="[0-9]{6}"
               maxLength={6}
-              required
-              autoFocus
-              placeholder="123456"
-              className={`${inputCls} text-center tracking-[0.35em] text-xl font-mono font-bold`}
+              className="w-full text-center tracking-[0.5em] text-2xl font-mono py-3 rounded-none bg-[#222222] border border-[#333333] text-white focus:border-[#C6A15B] focus:outline-none"
+              placeholder="000000"
               value={code}
               onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
+              required
+              autoFocus
             />
           </div>
 
-          <div className="space-y-2 pt-2">
-            <Button
-              type="submit"
-              disabled={loading || code.trim().length !== 6}
-              className="w-full justify-center py-2.5 text-xs font-semibold"
-            >
-              <Shield className="h-3.5 w-3.5 mr-1" />
-              <span>{loading ? "Vérification…" : "Déverrouiller mes billets"}</span>
-            </Button>
+          <Button
+            type="submit"
+            variant="primary"
+            className="w-full flex items-center justify-center gap-2 cursor-pointer py-3 text-sm"
+            disabled={loading || code.length !== 6}
+          >
+            <span>{loading ? "Vérification…" : "Valider mon code"}</span>
+            <ArrowRight className="w-4 h-4" />
+          </Button>
 
-            <button
-              type="button"
-              onClick={() => {
-                setStep("EMAIL");
-                setCode("");
-                setError("");
-              }}
-              className="w-full text-center text-xs text-[#666666] hover:text-[#111111] py-1 flex items-center justify-center gap-1"
-            >
-              <ArrowLeft className="h-3 w-3" />
-              <span>Utiliser une autre adresse e-mail</span>
-            </button>
-          </div>
+          <button
+            type="button"
+            onClick={() => {
+              setStep("EMAIL");
+              setCode("");
+              setError("");
+            }}
+            className="w-full text-center text-xs text-[#9E9B94] hover:text-[#F7F3EA] flex items-center justify-center gap-1.5"
+          >
+            <ArrowLeft className="w-3.5 h-3.5" />
+            <span>Changer d'adresse e-mail</span>
+          </button>
         </form>
       )}
     </div>
