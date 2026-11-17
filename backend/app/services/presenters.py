@@ -31,9 +31,15 @@ def concert_out(c: Concert, sold: dict[int, int]) -> dict:
         status = "ALMOST_FULL"
     else:
         status = "AVAILABLE"
+    
+    org_name = c.organizer.name if c.organizer else "ITIX"
+    org_slug = c.organizer.slug if c.organizer else "itix"
     return {
         "id": c.id, "name": c.name, "description": c.description, "venue": c.venue,
         "date": c.date, "total_seats": c.total_seats,
+        "organizer_id": c.organizer_id,
+        "organizer_name": org_name,
+        "organizer_slug": org_slug,
         "poster_url": f"/api/files/{c.poster_file_id}" if c.poster_file_id else None,
         "min_price": min((t["price"] for t in types), default=None),
         "remaining": remaining, "status": status, "ticket_types": types,
@@ -41,10 +47,15 @@ def concert_out(c: Concert, sold: dict[int, int]) -> dict:
 
 
 def order_out(o: Order) -> dict:
+    org_name = o.concert.organizer.name if o.concert and o.concert.organizer else "ITIX"
     return {
         "id": o.id, "reference": o.reference, "concert_id": o.concert_id,
-        "concert_name": o.concert.name, "concert_date": o.concert.date,
-        "ticket_type_name": o.ticket_type.name, "unit_price": o.unit_price,
+        "organizer_id": o.concert.organizer_id if o.concert else None,
+        "organizer_name": org_name,
+        "concert_name": o.concert.name if o.concert else "",
+        "concert_date": o.concert.date if o.concert else None,
+        "ticket_type_name": o.ticket_type.name if o.ticket_type else "",
+        "unit_price": o.unit_price,
         "quantity": o.quantity, "total_amount": o.total_amount,
         "customer_name": o.customer_name, "customer_email": o.customer_email,
         "pay_mode": o.pay_mode, "status": o.status, "payment_status": o.payment_status,

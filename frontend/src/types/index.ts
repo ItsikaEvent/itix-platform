@@ -1,37 +1,194 @@
-export interface TicketType { id: number; name: string; price: number; quantity: number; remaining: number }
+export interface TicketType {
+  id: number;
+  name: string;
+  price: number;
+  quantity: number;
+  remaining: number;
+}
+
 export type ConcertStatus = "AVAILABLE" | "ALMOST_FULL" | "SOLD_OUT" | "FINISHED";
+
 export interface Concert {
-  id: number; name: string; description: string; venue: string; date: string;
-  total_seats: number; poster_url: string | null; min_price: number | null;
-  remaining: number; status: ConcertStatus; ticket_types: TicketType[];
+  id: number;
+  name: string;
+  description: string;
+  venue: string;
+  date: string;
+  total_seats: number;
+  poster_url: string | null;
+  min_price: number | null;
+  remaining: number;
+  status: ConcertStatus;
+  ticket_types: TicketType[];
+  organizer_id?: number | null;
+  organizer_name?: string;
+  organizer_slug?: string;
 }
-export interface TicketInfo { number: string | null; status: "VALID" | "USED"; used_at: string | null }
+
+export interface Organizer {
+  id: number;
+  name: string;
+  email: string;
+  phone: string | null;
+  role: "SUPER_ADMIN" | "ORGANIZER";
+  slug: string;
+  is_active: boolean;
+  must_change_password: boolean;
+  commission_rate: number;
+  commission_total: number;
+  revenue_total: number;
+  revenue_net: number;
+  payouts_total: number;
+  balance_due: number;
+  totp_enabled?: boolean;
+  concerts_count: number;
+  orders_count: number;
+  created_at: string;
+}
+
+export interface AdminUser {
+  id: number;
+  name: string;
+  email: string;
+  role: "SUPER_ADMIN" | "ORGANIZER" | "STAFF_SCANNER";
+  slug: string;
+  must_change_password: boolean;
+  commission_rate?: number;
+  parent_organizer_id?: number | null;
+  assigned_concert_id?: number | null;
+  totp_enabled?: boolean;
+}
+
+export interface TicketInfo {
+  number: string | null;
+  status: "VALID" | "USED";
+  used_at: string | null;
+}
+
 export interface Order {
-  id: number; reference: string; concert_id: number; concert_name: string; concert_date: string;
-  ticket_type_name: string; unit_price: number; quantity: number; total_amount: number;
-  customer_name: string; customer_email: string; pay_mode: "PAY_NOW" | "RESERVE";
-  status: "PENDING" | "ACCEPTED" | "REJECTED"; payment_status: "UNPAID" | "PROOF_SUBMITTED" | "PAID";
-  has_proof: boolean; reject_reason: string | null; created_at: string; tickets: TicketInfo[];
+  id: number;
+  reference: string;
+  concert_id: number;
+  concert_name: string;
+  concert_date: string;
+  organizer_id?: number | null;
+  organizer_name?: string;
+  ticket_type_name: string;
+  unit_price: number;
+  quantity: number;
+  total_amount: number;
+  customer_name: string;
+  customer_email: string;
+  pay_mode: "PAY_NOW" | "RESERVE";
+  status: "PENDING" | "ACCEPTED" | "REJECTED";
+  payment_status: "UNPAID" | "PROOF_SUBMITTED" | "PAID";
+  has_proof: boolean;
+  reject_reason: string | null;
+  created_at: string;
+  tickets: TicketInfo[];
 }
+
 export interface Delivery {
-  order: Order; tickets: { number: string; qr_image: string }[];
+  order: Order;
+  tickets: { number: string; qr_image: string }[];
   email_status: "queued" | "smtp_not_configured";
 }
+
 export interface DashRow {
-  id: number; name: string; date: string; total_seats: number; ordered: number; paid: number;
-  unpaid: number; remaining: number; revenue_paid: number; revenue_pending: number;
+  id: number;
+  name: string;
+  date: string;
+  organizer_name?: string;
+  total_seats: number;
+  ordered: number;
+  paid: number;
+  unpaid: number;
+  remaining: number;
+  revenue_paid: number;
+  revenue_pending: number;
+  fill_rate?: number;
+  attendance_rate?: number;
+  tickets_used?: number;
+  tickets_generated?: number;
+  commission_rate?: number;
+  commission_amount?: number;
+  net_revenue?: number;
 }
+
 export interface Dashboard {
-  totals: Omit<DashRow, "id" | "name" | "date"> & {
-    orders_pending: number; orders_accepted: number; orders_rejected: number;
-    tickets_generated: number; tickets_used: number;
+  totals: Omit<DashRow, "id" | "name" | "date" | "organizer_name"> & {
+    orders_pending: number;
+    orders_accepted: number;
+    orders_rejected: number;
+    tickets_generated: number;
+    tickets_used: number;
+    overall_fill_rate: number;
+    overall_attendance_rate: number;
+    commission_amount: number;
+    net_revenue: number;
+    payouts_total: number;
+    balance_due: number;
   };
   per_concert: DashRow[];
 }
+
+export interface Payout {
+  id: number;
+  organizer_id: number;
+  organizer_name: string;
+  amount: number;
+  payment_method: string;
+  reference: string;
+  notes?: string | null;
+  created_at: string;
+}
+
+export interface StaffMember {
+  id: number;
+  name: string;
+  email: string;
+  role: "STAFF_SCANNER";
+  parent_organizer_id?: number | null;
+  assigned_concert_id?: number | null;
+  assigned_concert_name?: string | null;
+  is_active: boolean;
+  created_at: string;
+}
+
+export interface OfflineTicket {
+  token: string;
+  ticket_number: string;
+  status: "VALID" | "USED";
+  payment_status: string;
+  customer_name: string;
+  ticket_type: string;
+  unit_price: number;
+  used_at: string | null;
+}
+
+export interface OfflineManifest {
+  concert_id: number;
+  concert_name: string;
+  concert_date: string;
+  venue: string;
+  downloaded_at: string;
+  total_tickets: number;
+  tickets: OfflineTicket[];
+}
+
 export interface ScanResult {
-  result: "VALID" | "ALREADY_USED" | "NOT_PAID" | "RESERVATION" | "INVALID"; message: string;
-  ticket: { number: string; customer_name: string; ticket_type: string; concert_name: string;
-    concert_date: string; payment_status: string; used_at: string | null; unit_price?: number } | null;
+  result: "VALID" | "ALREADY_USED" | "NOT_PAID" | "RESERVATION" | "INVALID" | "WRONG_ORGANIZER";
+  message: string;
+  ticket: {
+    number: string;
+    customer_name: string;
+    ticket_type: string;
+    concert_name: string;
+    concert_date: string;
+    payment_status: string;
+    used_at: string | null;
+    unit_price?: number;
+  } | null;
 }
 
 export interface ClientTicket {
@@ -45,6 +202,8 @@ export interface ClientOrder {
   concert_name: string;
   concert_venue: string;
   concert_date: string;
+  organizer_name?: string;
+  organizer_slug?: string;
   ticket_type_name: string;
   quantity: number;
   unit_price: number;
@@ -60,6 +219,8 @@ export interface ClientOrder {
 
 export interface SupportMessage {
   id: number;
+  concert_id?: number | null;
+  organizer_id?: number | null;
   customer_name?: string;
   customer_email?: string;
   subject: string;
@@ -87,5 +248,3 @@ export interface ChatConversation {
   last_sender: "CLIENT" | "ADMIN";
   last_at: string;
 }
-
-

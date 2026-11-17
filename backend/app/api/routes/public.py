@@ -1,17 +1,27 @@
+import base64
 import secrets
 from typing import Literal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
-from pydantic import EmailStr
+from fastapi import (APIRouter, BackgroundTasks, Depends, File, Form, HTTPException,
+                     Response, UploadFile)
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_current_client
 from app.core.config import get_settings
+from app.core.limiter import rate_limit
+from app.core.security import create_client_token
 from app.core.timeutil import local_now
 from app.db.session import get_db
-from app.models.entities import Concert, Order, StoredFile, TicketType
+from app.models.entities import (Admin, ChatMessage, ClientAccount, Concert, Order,
+                                 StoredFile, SupportMessage, TicketType)
 from app.services.files import save_image
+from app.services.mailer import send_tickets_email, smtp_configured
 from app.services.presenters import concert_out, sold_map
+from app.services.tickets import ticket_images
+from app.services.totp import (generate_totp_secret, get_totp_qr_base64,
+                              get_totp_uri, verify_totp)
 
 router = APIRouter(prefix="/api", tags=["public"])
 
@@ -36,6 +46,27 @@ def get_concert(concert_id: int, db: Session = Depends(get_db)):
     return concert_out(c, sold_map(db))
 
 
+@router.get("/organizers/{slug}")
+def get_public_organizer(slug: str, db: Session = Depends(get_db)):
+    clean_slug = slug.strip().lower()
+    org = db.scalar(select(Admin).where(Admin.slug == clean_slug, Admin.is_active.is_(True)))
+    if not org:
+        raise HTTPException(404, "Organisateur introuvable.")
+    sold = sold_map(db)
+    concerts = db.scalars(
+        select(Concert)
+        .where(Concert.organizer_id == org.id)
+        .order_by(Concert.date.desc())
+    ).all()
+    return {
+        "id": org.id,
+        "name": org.name,
+        "slug": org.slug,
+        "phone": org.phone,
+        "concerts": [concert_out(c, sold) for c in concerts],
+    }
+
+
 @router.get("/files/{file_id}")
 def get_poster(file_id: str, db: Session = Depends(get_db)):
     """Public uniquement pour les affiches (les preuves de paiement restent privées)."""
@@ -55,7 +86,11 @@ def _new_reference(db: Session) -> str:
             return ref
 
 
-@router.post("/orders", status_code=201)
+@router.post(
+    "/orders",
+    status_code=201,
+    dependencies=[Depends(rate_limit(max_requests=25, window_seconds=60, key_prefix="orders"))],
+)
 def create_order(
     concert_id: int = Form(...),
     ticket_type_id: int = Form(...),
@@ -63,9 +98,14 @@ def create_order(
     customer_name: str = Form(..., min_length=2, max_length=120),
     customer_email: EmailStr = Form(...),
     pay_mode: Literal["PAY_NOW", "RESERVE"] = Form(...),
+    consent_cgu_cgv: bool = Form(True),
+    consent_privacy: bool = Form(True),
     proof: UploadFile | None = File(None),
     db: Session = Depends(get_db),
 ):
+    if not consent_cgu_cgv or not consent_privacy:
+        raise HTTPException(422, "Vous devez accepter les CGV, les CGU et la Politique de Confidentialité.")
+
     has_proof = proof is not None and bool(proof.filename)
     if pay_mode == "PAY_NOW" and not has_proof:
         raise HTTPException(422, "La preuve de paiement est obligatoire pour payer maintenant.")
@@ -87,33 +127,258 @@ def create_order(
 
     proof_file = save_image(db, proof) if pay_mode == "PAY_NOW" and has_proof else None
     order = Order(
-        reference=_new_reference(db), concert_id=concert_id, ticket_type_id=tt.id,
-        customer_name=customer_name.strip(), customer_email=str(customer_email).lower(),
-        quantity=quantity, unit_price=tt.price, total_amount=tt.price * quantity,
-        pay_mode=pay_mode, proof_file_id=proof_file.id if proof_file else None,
+        reference=_new_reference(db),
+        concert_id=concert_id,
+        ticket_type_id=tt.id,
+        customer_name=customer_name.strip(),
+        customer_email=str(customer_email).lower(),
+        quantity=quantity,
+        unit_price=tt.price,
+        total_amount=tt.price * quantity,
+        pay_mode=pay_mode,
+        consent_cgu_cgv=consent_cgu_cgv,
+        consent_privacy=consent_privacy,
+        proof_file_id=proof_file.id if proof_file else None,
         payment_status="PROOF_SUBMITTED" if proof_file else "UNPAID",
     )
     db.add(order)
+    clean_cust_email = str(customer_email).lower().strip()
+    if not db.scalar(select(ClientAccount.id).where(ClientAccount.email == clean_cust_email)):
+        db.add(ClientAccount(
+            email=clean_cust_email,
+            name=customer_name.strip(),
+            totp_secret=generate_totp_secret(),
+            is_verified=False,
+        ))
     db.commit()
-    return {"reference": order.reference, "quantity": order.quantity,
-            "total_amount": order.total_amount, "customer_email": order.customer_email,
-            "pay_mode": order.pay_mode}
+    return {
+        "reference": order.reference,
+        "quantity": order.quantity,
+        "total_amount": order.total_amount,
+        "customer_email": order.customer_email,
+        "pay_mode": order.pay_mode,
+    }
 
 
-# ------------------------------------------------------------------ Espace Client & Mes Billets
-import base64
-from fastapi import BackgroundTasks
-from pydantic import BaseModel, Field
-from app.models.entities import SupportMessage
-from app.services.mailer import send_tickets_email, smtp_configured
-from app.services.tickets import ticket_images
+# ------------------------------------------------------------------ Authentification Client (2FA Optionnel)
+class ClientAuthCheckIn(BaseModel):
+    email: EmailStr
 
 
+class ClientAuthSimpleIn(BaseModel):
+    email: EmailStr
+    name: str | None = None
+
+
+class ClientAuthSetupIn(BaseModel):
+    email: EmailStr
+    name: str = Field(..., min_length=2, max_length=120)
+
+
+class ClientAuthVerifyIn(BaseModel):
+    email: EmailStr
+    code: str = Field(..., min_length=6, max_length=6)
+
+
+class Confirm2FaIn(BaseModel):
+    code: str = Field(..., min_length=6, max_length=6)
+
+
+@router.post("/client/auth/check")
+def check_client_auth(body: ClientAuthCheckIn, db: Session = Depends(get_db)):
+    clean_email = str(body.email).strip().lower()
+    acc = db.scalar(select(ClientAccount).where(ClientAccount.email == clean_email))
+    if acc:
+        return {
+            "has_account": True,
+            "totp_enabled": acc.totp_enabled,
+            "is_verified": acc.is_verified,
+            "name": acc.name,
+        }
+    last_order = db.scalar(
+        select(Order).where(Order.customer_email == clean_email).order_by(Order.id.desc())
+    )
+    return {
+        "has_account": False,
+        "totp_enabled": False,
+        "is_verified": False,
+        "name": last_order.customer_name if last_order else "",
+        "has_orders": bool(last_order),
+    }
+
+
+@router.post("/client/auth/login-simple")
+def login_simple_client(body: ClientAuthSimpleIn, db: Session = Depends(get_db)):
+    clean_email = str(body.email).strip().lower()
+    acc = db.scalar(select(ClientAccount).where(ClientAccount.email == clean_email))
+    if acc and acc.totp_enabled:
+        raise HTTPException(
+            403,
+            "Ce compte a activé la protection 2FA. Veuillez saisir le code à 6 chiffres de votre application.",
+        )
+
+    if not acc:
+        cust_name = body.name.strip() if body.name else None
+        if not cust_name:
+            last_order = db.scalar(
+                select(Order).where(Order.customer_email == clean_email).order_by(Order.id.desc())
+            )
+            cust_name = last_order.customer_name if last_order else "Spectateur"
+        acc = ClientAccount(
+            email=clean_email,
+            name=cust_name,
+            totp_enabled=False,
+            is_verified=False,
+        )
+        db.add(acc)
+    else:
+        if body.name and body.name.strip():
+            acc.name = body.name.strip()
+    db.commit()
+
+    token = create_client_token(acc.email, acc.name)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "email": acc.email,
+            "name": acc.name,
+            "totp_enabled": False,
+        },
+    }
+
+
+@router.post("/client/auth/enable-2fa")
+def enable_client_2fa(
+    client: dict = Depends(get_current_client),
+    db: Session = Depends(get_db),
+):
+    clean_email = client["sub"]
+    acc = db.scalar(select(ClientAccount).where(ClientAccount.email == clean_email))
+    if not acc:
+        raise HTTPException(404, "Compte introuvable.")
+
+    secret = generate_totp_secret()
+    acc.totp_secret = secret
+    db.commit()
+
+    uri = get_totp_uri(clean_email, secret)
+    qr_code = get_totp_qr_base64(uri)
+    return {
+        "secret": secret,
+        "uri": uri,
+        "qr_code": qr_code,
+        "message": "Scannez ce QR Code dans Google Authenticator ou Microsoft Authenticator.",
+    }
+
+
+@router.post("/client/auth/confirm-enable-2fa")
+def confirm_enable_client_2fa(
+    body: Confirm2FaIn,
+    client: dict = Depends(get_current_client),
+    db: Session = Depends(get_db),
+):
+    clean_email = client["sub"]
+    acc = db.scalar(select(ClientAccount).where(ClientAccount.email == clean_email))
+    if not acc or not acc.totp_secret:
+        raise HTTPException(400, "Veuillez d'abord initialiser l'activation du 2FA.")
+
+    if not verify_totp(acc.totp_secret, body.code):
+        raise HTTPException(401, "Code d'authentification invalide. Vérifiez l'heure de votre appareil.")
+
+    acc.totp_enabled = True
+    acc.is_verified = True
+    db.commit()
+    return {"message": "Protection 2FA activée avec succès sur votre compte.", "totp_enabled": True}
+
+
+@router.post("/client/auth/disable-2fa")
+def disable_client_2fa(
+    client: dict = Depends(get_current_client),
+    db: Session = Depends(get_db),
+):
+    clean_email = client["sub"]
+    acc = db.scalar(select(ClientAccount).where(ClientAccount.email == clean_email))
+    if not acc:
+        raise HTTPException(404, "Compte introuvable.")
+
+    acc.totp_enabled = False
+    db.commit()
+    return {"message": "Protection 2FA désactivée.", "totp_enabled": False}
+
+
+@router.post("/client/auth/setup")
+def setup_client_totp(body: ClientAuthSetupIn, db: Session = Depends(get_db)):
+    clean_email = str(body.email).strip().lower()
+    acc = db.scalar(select(ClientAccount).where(ClientAccount.email == clean_email))
+    if acc and acc.totp_enabled and acc.is_verified:
+        raise HTTPException(
+            400,
+            "Votre compte est déjà associé à une application d'authentification. Veuillez saisir votre code TOTP.",
+        )
+
+    secret = generate_totp_secret()
+    if not acc:
+        acc = ClientAccount(
+            email=clean_email,
+            name=body.name.strip(),
+            totp_secret=secret,
+            totp_enabled=False,
+            is_verified=False,
+        )
+        db.add(acc)
+    else:
+        acc.name = body.name.strip()
+        acc.totp_secret = secret
+
+    db.commit()
+    uri = get_totp_uri(clean_email, secret)
+    qr_code = get_totp_qr_base64(uri)
+    return {
+        "email": clean_email,
+        "secret": secret,
+        "uri": uri,
+        "qr_code": qr_code,
+        "message": "Scannez ce QR Code dans votre application d'authentification puis saisissez le code à 6 chiffres.",
+    }
+
+
+@router.post("/client/auth/verify")
+def verify_client_totp(body: ClientAuthVerifyIn, db: Session = Depends(get_db)):
+    clean_email = str(body.email).strip().lower()
+    acc = db.scalar(select(ClientAccount).where(ClientAccount.email == clean_email))
+    if not acc or not acc.totp_secret:
+        raise HTTPException(404, "Aucun compte client ou secret 2FA trouvé pour cette adresse e-mail.")
+
+    if not verify_totp(acc.totp_secret, body.code):
+        raise HTTPException(
+            401,
+            "Code d'accès invalide ou expiré. Assurez-vous que l'heure de votre téléphone est synchronisée.",
+        )
+
+    acc.totp_enabled = True
+    acc.is_verified = True
+    db.commit()
+
+    token = create_client_token(acc.email, acc.name)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "email": acc.email,
+            "name": acc.name,
+            "totp_enabled": True,
+        },
+    }
+
+
+# ------------------------------------------------------------------ Espace Client & Mes Billets (Sécurisé TOTP)
 @router.get("/client/orders")
-def get_client_orders(email: str, db: Session = Depends(get_db)):
-    clean_email = email.strip().lower()
-    if not clean_email:
-        raise HTTPException(400, "Adresse e-mail requise.")
+def get_client_orders(
+    client: dict = Depends(get_current_client),
+    db: Session = Depends(get_db),
+):
+    clean_email = client["sub"]
 
     orders = db.scalars(
         select(Order)
@@ -132,13 +397,18 @@ def get_client_orders(email: str, db: Session = Depends(get_db)):
                     "qr_image": "data:image/png;base64," + base64.b64encode(p).decode(),
                 })
 
+        org_name = o.concert.organizer.name if o.concert and o.concert.organizer else "ITIX"
+        org_slug = o.concert.organizer.slug if o.concert and o.concert.organizer else "itix"
+
         result.append({
             "id": o.id,
             "reference": o.reference,
-            "concert_name": o.concert.name,
-            "concert_venue": o.concert.venue,
-            "concert_date": o.concert.date.isoformat(),
-            "ticket_type_name": o.ticket_type.name,
+            "concert_name": o.concert.name if o.concert else "",
+            "concert_venue": o.concert.venue if o.concert else "",
+            "concert_date": o.concert.date.isoformat() if o.concert else "",
+            "organizer_name": org_name,
+            "organizer_slug": org_slug,
+            "ticket_type_name": o.ticket_type.name if o.ticket_type else "",
             "quantity": o.quantity,
             "unit_price": o.unit_price,
             "total_amount": o.total_amount,
@@ -155,8 +425,13 @@ def get_client_orders(email: str, db: Session = Depends(get_db)):
 
 
 @router.post("/client/orders/{order_id}/resend-email")
-def client_resend_email(order_id: int, email: str, bg: BackgroundTasks, db: Session = Depends(get_db)):
-    clean_email = email.strip().lower()
+def client_resend_email(
+    order_id: int,
+    bg: BackgroundTasks,
+    client: dict = Depends(get_current_client),
+    db: Session = Depends(get_db),
+):
+    clean_email = client["sub"]
     o = db.scalar(select(Order).where(Order.id == order_id, Order.customer_email == clean_email))
     if not o:
         raise HTTPException(404, "Commande introuvable pour cette adresse e-mail.")
@@ -186,16 +461,33 @@ class ClientMessageIn(BaseModel):
     customer_email: EmailStr
     customer_name: str = Field(..., min_length=2, max_length=120)
     order_reference: str | None = None
+    concert_id: int | None = None
     subject: str = Field(..., min_length=3, max_length=150)
     message: str = Field(..., min_length=5, max_length=2000)
 
 
 @router.post("/client/messages", status_code=201)
 def create_support_message(body: ClientMessageIn, db: Session = Depends(get_db)):
+    effective_org_id = None
+    effective_cid = body.concert_id
+
+    # Si un numéro de commande est fourni mais pas de concert_id
+    if not effective_cid and body.order_reference:
+        order = db.scalar(select(Order).where(Order.reference == body.order_reference.strip()))
+        if order:
+            effective_cid = order.concert_id
+
+    if effective_cid:
+        concert = db.get(Concert, effective_cid)
+        if concert:
+            effective_org_id = concert.organizer_id
+
     msg = SupportMessage(
         customer_email=str(body.customer_email).lower().strip(),
         customer_name=body.customer_name.strip(),
         order_reference=body.order_reference.strip() if body.order_reference else None,
+        concert_id=effective_cid,
+        organizer_id=effective_org_id,
         subject=body.subject.strip(),
         message=body.message.strip(),
     )
@@ -203,7 +495,7 @@ def create_support_message(body: ClientMessageIn, db: Session = Depends(get_db))
     db.commit()
     return {
         "id": msg.id,
-        "message": "Votre message a été envoyé à l'équipe. Nous vous répondrons rapidement.",
+        "message": "Votre message a été transmis à l'équipe organisatrice. Nous vous répondrons rapidement.",
         "created_at": msg.created_at.isoformat(),
     }
 
@@ -235,21 +527,20 @@ def list_client_messages(email: str, db: Session = Depends(get_db)):
     ]
 
 
-# ------------------------------------------------------------------ Messagerie Instantanée (Chat / SMS Style)
-from app.models.entities import ChatMessage
-
-
+# ------------------------------------------------------------------ Messagerie Instantanée (Chat)
 class ChatMessageIn(BaseModel):
-    customer_email: EmailStr
-    customer_name: str = Field(..., min_length=2, max_length=120)
+    customer_email: EmailStr | None = None
+    customer_name: str | None = None
+    concert_id: int | None = None
     message: str = Field(..., min_length=1, max_length=2000)
 
 
 @router.get("/client/chat")
-def get_chat_history(email: str, db: Session = Depends(get_db)):
-    clean_email = email.strip().lower()
-    if not clean_email:
-        raise HTTPException(400, "Adresse e-mail requise.")
+def get_chat_history(
+    client: dict = Depends(get_current_client),
+    db: Session = Depends(get_db),
+):
+    clean_email = client["sub"]
 
     messages = db.scalars(
         select(ChatMessage)
@@ -262,7 +553,7 @@ def get_chat_history(email: str, db: Session = Depends(get_db)):
             "id": m.id,
             "customer_email": m.customer_email,
             "customer_name": m.customer_name,
-            "sender": m.sender,  # CLIENT | ADMIN
+            "sender": m.sender,
             "message": m.message,
             "created_at": m.created_at.isoformat(),
         }
@@ -271,10 +562,25 @@ def get_chat_history(email: str, db: Session = Depends(get_db)):
 
 
 @router.post("/client/chat", status_code=201)
-def post_chat_message(body: ChatMessageIn, db: Session = Depends(get_db)):
+def post_chat_message(
+    body: ChatMessageIn,
+    client: dict = Depends(get_current_client),
+    db: Session = Depends(get_db),
+):
+    clean_email = client["sub"]
+    cust_name = client.get("name") or body.customer_name or "Client"
+
+    effective_org_id = None
+    if body.concert_id:
+        c = db.get(Concert, body.concert_id)
+        if c:
+            effective_org_id = c.organizer_id
+
     msg = ChatMessage(
-        customer_email=str(body.customer_email).lower().strip(),
-        customer_name=body.customer_name.strip(),
+        customer_email=clean_email,
+        customer_name=cust_name,
+        concert_id=body.concert_id,
+        organizer_id=effective_org_id,
         sender="CLIENT",
         message=body.message.strip(),
     )
@@ -290,3 +596,35 @@ def post_chat_message(body: ChatMessageIn, db: Session = Depends(get_db)):
     }
 
 
+# ------------------------------------------------------------------ RGPD & CMIL Madagascar (Loi 2014-038)
+class PrivacyRequestIn(BaseModel):
+    customer_name: str = Field(..., min_length=2, max_length=120)
+    customer_email: EmailStr
+    request_type: Literal["ACCESS", "RECTIFICATION", "DELETION", "OPPOSITION"]
+    details: str = Field(..., min_length=5, max_length=1000)
+
+
+@router.post("/privacy/request", status_code=201)
+def submit_privacy_request(body: PrivacyRequestIn, db: Session = Depends(get_db)):
+    labels = {
+        "ACCESS": "Droit d'accès",
+        "RECTIFICATION": "Droit de rectification",
+        "DELETION": "Droit à l'effacement / suppression",
+        "OPPOSITION": "Droit d'opposition",
+    }
+    label = labels.get(body.request_type, body.request_type)
+    msg = SupportMessage(
+        customer_email=str(body.customer_email).lower().strip(),
+        customer_name=body.customer_name.strip(),
+        subject=f"[RGPD/CMIL - {label}] Exercice des droits sur les données personnelles",
+        message=f"Type de demande : {label} ({body.request_type})\n\nDétails :\n{body.details.strip()}",
+    )
+    db.add(msg)
+    db.commit()
+    return {
+        "message": (
+            "Votre demande d'exercice de vos droits (conforme RGPD et Loi n° 2014-038 / CMIL Madagascar) "
+            "a été enregistrée avec succès. Notre équipe vous apportera une réponse sous un délai légal de 30 jours."
+        ),
+        "request_id": msg.id,
+    }

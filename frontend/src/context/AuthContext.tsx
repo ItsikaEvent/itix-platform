@@ -1,20 +1,128 @@
-import { createContext, useContext, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import { api, TOKEN_KEY } from "../api/client";
+import type { AdminUser } from "../types";
 
-interface Auth { isAuth: boolean; login: (email: string, password: string) => Promise<void>; logout: () => void }
-const Ctx = createContext<Auth>(null!);
-export const useAuth = () => useContext(Ctx);
+const USER_KEY = "itix_admin_user";
+
+export interface LoginResult {
+  requires_totp_setup?: boolean;
+  requires_totp?: boolean;
+  setup_token?: string;
+  auth_token?: string;
+  qr_code?: string;
+  secret?: string;
+  email?: string;
+  must_change_password?: boolean;
+  role?: string;
+}
+
+interface AuthContextType {
+  user: AdminUser | null;
+  isAuth: boolean;
+  isSuperAdmin: boolean;
+  login: (email: string, password: string) => Promise<LoginResult>;
+  verifyTotp: (token: string, code: string) => Promise<{ must_change_password: boolean; role?: string }>;
+  logout: () => void;
+  changePassword: (newPassword: string, oldPassword?: string) => Promise<void>;
+  refreshUser: () => Promise<void>;
+}
+
+const AuthContext = createContext<AuthContextType>(null!);
+export const useAuth = () => useContext(AuthContext);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [token, setToken] = useState(localStorage.getItem(TOKEN_KEY));
-  const login = async (email: string, password: string) => {
+  const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY));
+  const [user, setUser] = useState<AdminUser | null>(() => {
+    const raw = localStorage.getItem(USER_KEY);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as AdminUser;
+    } catch {
+      return null;
+    }
+  });
+
+  const refreshUser = async () => {
+    try {
+      const { data } = await api.get<AdminUser>("/api/auth/me");
+      setUser(data);
+      localStorage.setItem(USER_KEY, JSON.stringify(data));
+    } catch {
+      logout();
+    }
+  };
+
+  useEffect(() => {
+    if (token && !user) {
+      refreshUser();
+    }
+  }, [token]);
+
+  const login = async (email: string, password: string): Promise<LoginResult> => {
     const { data } = await api.post("/api/auth/login", { email, password });
+    if (data.requires_totp_setup || data.requires_totp) {
+      return data as LoginResult;
+    }
+
     localStorage.setItem(TOKEN_KEY, data.access_token);
     setToken(data.access_token);
+
+    if (data.user) {
+      localStorage.setItem(USER_KEY, JSON.stringify(data.user));
+      setUser(data.user);
+      return { must_change_password: data.user.must_change_password, role: data.user.role };
+    }
+    await refreshUser();
+    return { must_change_password: false };
   };
+
+  const verifyTotp = async (tokenStr: string, code: string) => {
+    const { data } = await api.post("/api/auth/verify-totp", { token: tokenStr, code });
+    localStorage.setItem(TOKEN_KEY, data.access_token);
+    setToken(data.access_token);
+
+    if (data.user) {
+      localStorage.setItem(USER_KEY, JSON.stringify(data.user));
+      setUser(data.user);
+      return { must_change_password: data.user.must_change_password, role: data.user.role };
+    }
+    await refreshUser();
+    return { must_change_password: false };
+  };
+
   const logout = () => {
     localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(USER_KEY);
     setToken(null);
+    setUser(null);
   };
-  return <Ctx.Provider value={{ isAuth: !!token, login, logout }}>{children}</Ctx.Provider>;
+
+  const changePassword = async (newPassword: string, oldPassword?: string) => {
+    await api.post("/api/auth/change-password", {
+      new_password: newPassword,
+      old_password: oldPassword || undefined,
+    });
+    if (user) {
+      const updated = { ...user, must_change_password: false };
+      setUser(updated);
+      localStorage.setItem(USER_KEY, JSON.stringify(updated));
+    }
+  };
+
+  return (
+    <AuthContext.Provider
+      value={{
+        user,
+        isAuth: !!token,
+        isSuperAdmin: user?.role === "SUPER_ADMIN",
+        login,
+        verifyTotp,
+        logout,
+        changePassword,
+        refreshUser,
+      }}
+    >
+      {children}
+    </AuthContext.Provider>
+  );
 }

@@ -255,9 +255,14 @@ body, button, input, select, textarea {
   border: 1px solid #DCD9D3;
   background-color: #FFFFFF;
   padding: 0.65rem 0.95rem;
-  font-size: 0.875rem;
+  font-size: 1rem; /* 16px to prevent annoying auto-zoom on iOS Safari */
   color: #111111;
   outline: none;
+}
+@media (min-width: 768px) {
+  .itix-input {
+    font-size: 0.875rem;
+  }
 }
 .itix-input::placeholder {
   color: #8C877E;

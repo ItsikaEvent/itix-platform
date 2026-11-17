@@ -4,6 +4,17 @@ import tailwindcss from "@tailwindcss/vite";
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
-  // usePolling : rechargement à chaud fiable dans Docker sous Windows
   server: { host: true, port: 5173, watch: { usePolling: true } },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          "vendor-react": ["react", "react-dom", "react-router-dom"],
+          "vendor-qr": ["html5-qrcode"],
+          "vendor-axios": ["axios"],
+        },
+      },
+    },
+    chunkSizeWarningLimit: 600,
+  },
 });

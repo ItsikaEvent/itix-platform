@@ -36,9 +36,7 @@ export default function ClientMessaging() {
     if (!clientUser?.email) return;
     if (showLoading) setLoading(true);
     try {
-      const { data } = await api.get<ChatMessageItem[]>("/api/client/chat", {
-        params: { email: clientUser.email },
-      });
+      const { data } = await api.get<ChatMessageItem[]>("/api/client/chat");
       setMessages(data);
       setTimeout(() => scrollToBottom(), 50);
     } catch (e) {
@@ -81,8 +79,6 @@ export default function ClientMessaging() {
 
     try {
       await api.post("/api/client/chat", {
-        customer_email: clientUser.email,
-        customer_name: clientUser.name,
         message: text,
       });
       await loadMessages(false);

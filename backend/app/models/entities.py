@@ -1,7 +1,8 @@
+import re
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, LargeBinary, String, Text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, LargeBinary, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.timeutil import local_now
@@ -11,10 +12,17 @@ from app.db.base import Base
 ORDER_PENDING, ORDER_ACCEPTED, ORDER_REJECTED = "PENDING", "ACCEPTED", "REJECTED"
 PAY_UNPAID, PAY_PROOF, PAY_PAID = "UNPAID", "PROOF_SUBMITTED", "PAID"
 TICKET_VALID, TICKET_USED = "VALID", "USED"
+ROLE_SUPER_ADMIN, ROLE_ORGANIZER, ROLE_STAFF_SCANNER = "SUPER_ADMIN", "ORGANIZER", "STAFF_SCANNER"
 
 
 def _uuid() -> str:
     return str(uuid.uuid4())
+
+
+def slugify(text: str) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"[^\w\s-]", "", text)
+    return re.sub(r"[\s_-]+", "-", text).strip("-") or "org"
 
 
 class StoredFile(Base):
@@ -30,13 +38,39 @@ class StoredFile(Base):
 class Admin(Base):
     __tablename__ = "admins"
     id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), default="Organisateur")
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
+    role: Mapped[str] = mapped_column(String(20), default=ROLE_ORGANIZER, index=True)
+    slug: Mapped[str] = mapped_column(String(140), unique=True, index=True, default=_uuid)
+    phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    commission_rate: Mapped[float] = mapped_column(Float, default=5.0)  # Taux commission ITIX (ex: 5.0%)
+    totp_secret: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    parent_organizer_id: Mapped[int | None] = mapped_column(
+        ForeignKey("admins.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    assigned_concert_id: Mapped[int | None] = mapped_column(
+        ForeignKey("concerts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
+
+    concerts: Mapped[list["Concert"]] = relationship(
+        back_populates="organizer", foreign_keys="Concert.organizer_id", cascade="all, delete-orphan", lazy="selectin"
+    )
+    payouts: Mapped[list["Payout"]] = relationship(
+        back_populates="organizer", cascade="all, delete-orphan", lazy="selectin"
+    )
 
 
 class Concert(Base):
     __tablename__ = "concerts"
     id: Mapped[int] = mapped_column(primary_key=True)
+    organizer_id: Mapped[int | None] = mapped_column(
+        ForeignKey("admins.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     name: Mapped[str] = mapped_column(String(150))
     description: Mapped[str] = mapped_column(Text, default="")
     venue: Mapped[str] = mapped_column(String(200))
@@ -47,6 +81,9 @@ class Concert(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
 
+    organizer: Mapped[Admin | None] = relationship(
+        back_populates="concerts", foreign_keys=[organizer_id], lazy="selectin"
+    )
     ticket_types: Mapped[list["TicketType"]] = relationship(
         back_populates="concert", cascade="all, delete-orphan",
         lazy="selectin", order_by="TicketType.price",
@@ -90,6 +127,8 @@ class Order(Base):
         ForeignKey("files.id", ondelete="SET NULL"), nullable=True
     )
     reject_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    consent_cgu_cgv: Mapped[bool] = mapped_column(Boolean, default=True)
+    consent_privacy: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
     processed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
@@ -117,6 +156,8 @@ class Ticket(Base):
 class SupportMessage(Base):
     __tablename__ = "support_messages"
     id: Mapped[int] = mapped_column(primary_key=True)
+    concert_id: Mapped[int | None] = mapped_column(ForeignKey("concerts.id", ondelete="SET NULL"), nullable=True, index=True)
+    organizer_id: Mapped[int | None] = mapped_column(ForeignKey("admins.id", ondelete="SET NULL"), nullable=True, index=True)
     customer_email: Mapped[str] = mapped_column(String(255), index=True)
     customer_name: Mapped[str] = mapped_column(String(120))
     order_reference: Mapped[str | None] = mapped_column(String(30), nullable=True)
@@ -131,10 +172,41 @@ class SupportMessage(Base):
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
     id: Mapped[int] = mapped_column(primary_key=True)
+    concert_id: Mapped[int | None] = mapped_column(ForeignKey("concerts.id", ondelete="SET NULL"), nullable=True, index=True)
+    organizer_id: Mapped[int | None] = mapped_column(ForeignKey("admins.id", ondelete="SET NULL"), nullable=True, index=True)
     customer_email: Mapped[str] = mapped_column(String(255), index=True)
     customer_name: Mapped[str] = mapped_column(String(120))
     sender: Mapped[str] = mapped_column(String(10), default="CLIENT")  # CLIENT | ADMIN
     message: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
+
+
+class ClientAccount(Base):
+    __tablename__ = "client_accounts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    totp_secret: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
+
+
+class Payout(Base):
+    __tablename__ = "payouts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organizer_id: Mapped[int] = mapped_column(
+        ForeignKey("admins.id", ondelete="CASCADE"), index=True
+    )
+    amount: Mapped[int] = mapped_column(Integer)  # Net reversé en Ariary
+    payment_method: Mapped[str] = mapped_column(String(30))  # MVOLA, ORANGE_MONEY, AIRTEL_MONEY, BANK_TRANSFER, CASH
+    reference: Mapped[str] = mapped_column(String(100))  # Référence transaction opérateur
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
+
+    organizer: Mapped["Admin"] = relationship("Admin", back_populates="payouts", lazy="joined")
+
+
+
 
 
