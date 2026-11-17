@@ -1,0 +1,9 @@
+{
+  "name": "itix-platform",
+  "private": true,
+  "scripts": {
+    "dev": "./start_dev.sh",
+    "start": "./start_dev.sh",
+    "seed": "PYTHONPATH=backend .venv/bin/python -m app.services.seed_demo --force"
+  }
+}
