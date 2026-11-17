@@ -19,6 +19,7 @@ import {
   FileText,
   Menu,
   X,
+  Coins,
 } from "./icons";
 import { useAuth } from "../context/AuthContext";
 import { useClientAuth } from "../context/ClientAuthContext";
@@ -284,9 +285,13 @@ export function AdminLayout() {
                   {user.name}
                 </span>
                 <span className={`px-2 py-0.5 rounded text-[9px] font-bold tracking-wider ${
-                  isSuperAdmin ? "bg-purple-900/60 text-purple-200 border border-purple-700" : "bg-[#641C2D]/60 text-rose-200 border border-[#641C2D]"
+                  user.role === "STAFF_SCANNER"
+                    ? "bg-cyan-900/60 text-cyan-200 border border-cyan-700"
+                    : isSuperAdmin
+                    ? "bg-purple-900/60 text-purple-200 border border-purple-700"
+                    : "bg-[#641C2D]/60 text-rose-200 border border-[#641C2D]"
                 }`}>
-                  {isSuperAdmin ? "SUPER ADMIN" : "ORGANISATEUR"}
+                  {user.role === "STAFF_SCANNER" ? "CONTRÔLEUR" : isSuperAdmin ? "SUPER ADMIN" : "ORGANISATEUR"}
                 </span>
               </div>
               <p className="text-[10px] text-[#888888] truncate mt-0.5">{user.email}</p>
@@ -295,56 +300,77 @@ export function AdminLayout() {
 
           {/* Admin Navigation */}
           <nav className="p-3 space-y-1">
-            <NavLink to="/admin" end className={adminNavLinkClass}>
-              <LayoutDashboard className="h-4 w-4 text-[#641C2D]" />
-              <span>Tableau de bord</span>
-            </NavLink>
-
-            {isSuperAdmin && (
-              <NavLink to="/admin/organizers" className={adminNavLinkClass}>
-                <Users className="h-4 w-4 text-[#641C2D]" />
-                <span>Organisateurs</span>
+            {user?.role === "STAFF_SCANNER" ? (
+              <NavLink to="/admin/scanner" className={adminNavLinkClass}>
+                <ScanLine className="h-4 w-4 text-[#641C2D]" />
+                <span>Scanner Contrôle d'accès</span>
               </NavLink>
-            )}
+            ) : (
+              <>
+                <NavLink to="/admin" end className={adminNavLinkClass}>
+                  <LayoutDashboard className="h-4 w-4 text-[#641C2D]" />
+                  <span>Tableau de bord</span>
+                </NavLink>
 
-            <NavLink to="/admin/concerts" className={adminNavLinkClass}>
-              <Music className="h-4 w-4 text-[#641C2D]" />
-              <span>Événements & Concerts</span>
-            </NavLink>
+                {isSuperAdmin && (
+                  <NavLink to="/admin/organizers" className={adminNavLinkClass}>
+                    <Users className="h-4 w-4 text-[#641C2D]" />
+                    <span>Organisateurs</span>
+                  </NavLink>
+                )}
 
-            <NavLink to="/admin/orders" className={adminNavLinkClass}>
-              <Receipt className="h-4 w-4 text-[#641C2D]" />
-              <span>Commandes & Billets</span>
-            </NavLink>
+                <NavLink to="/admin/concerts" className={adminNavLinkClass}>
+                  <Music className="h-4 w-4 text-[#641C2D]" />
+                  <span>Événements & Concerts</span>
+                </NavLink>
 
-            <NavLink to="/admin/scanner" className={adminNavLinkClass}>
-              <ScanLine className="h-4 w-4 text-[#641C2D]" />
-              <span>Contrôle d'accès (QR)</span>
-            </NavLink>
+                <NavLink to="/admin/orders" className={adminNavLinkClass}>
+                  <Receipt className="h-4 w-4 text-[#641C2D]" />
+                  <span>Commandes & Billets</span>
+                </NavLink>
 
-            <NavLink to="/admin/support" className={adminNavLinkClass}>
-              <MessageSquare className="h-4 w-4 text-[#641C2D]" />
-              <span>Messagerie Support</span>
-            </NavLink>
+                <NavLink to="/admin/payouts" className={adminNavLinkClass}>
+                  <Coins className="h-4 w-4 text-[#641C2D]" />
+                  <span>Reversements</span>
+                </NavLink>
 
-            {isSuperAdmin && (
-              <NavLink to="/admin/email" className={adminNavLinkClass}>
-                <Mail className="h-4 w-4 text-[#641C2D]" />
-                <span>Configuration E-mails</span>
-              </NavLink>
+                <NavLink to="/admin/staff" className={adminNavLinkClass}>
+                  <Users className="h-4 w-4 text-[#641C2D]" />
+                  <span>Équipe & Contrôleurs</span>
+                </NavLink>
+
+                <NavLink to="/admin/scanner" className={adminNavLinkClass}>
+                  <ScanLine className="h-4 w-4 text-[#641C2D]" />
+                  <span>Contrôle d'accès (QR)</span>
+                </NavLink>
+
+                <NavLink to="/admin/support" className={adminNavLinkClass}>
+                  <MessageSquare className="h-4 w-4 text-[#641C2D]" />
+                  <span>Messagerie Support</span>
+                </NavLink>
+
+                {isSuperAdmin && (
+                  <NavLink to="/admin/email" className={adminNavLinkClass}>
+                    <Mail className="h-4 w-4 text-[#641C2D]" />
+                    <span>Configuration E-mails</span>
+                  </NavLink>
+                )}
+              </>
             )}
           </nav>
         </div>
 
         {/* Footer Actions */}
         <div className="p-4 border-t border-[#222222] space-y-2">
-          <Link
-            to="/"
-            className="flex items-center gap-2 px-3 py-2 text-xs font-medium text-[#DCD9D3] hover:text-[#FFFFFF]"
-          >
-            <ArrowLeft className="h-3.5 w-3.5" />
-            <span>Portail Billetterie</span>
-          </Link>
+          {user?.role !== "STAFF_SCANNER" && (
+            <Link
+              to="/"
+              className="flex items-center gap-2 px-3 py-2 text-xs font-medium text-[#DCD9D3] hover:text-[#FFFFFF]"
+            >
+              <ArrowLeft className="h-3.5 w-3.5" />
+              <span>Portail Billetterie</span>
+            </Link>
+          )}
 
           <button
             onClick={logout}

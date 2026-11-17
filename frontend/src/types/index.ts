@@ -34,9 +34,15 @@ export interface Organizer {
   slug: string;
   is_active: boolean;
   must_change_password: boolean;
+  commission_rate: number;
+  commission_total: number;
+  revenue_total: number;
+  revenue_net: number;
+  payouts_total: number;
+  balance_due: number;
+  totp_enabled?: boolean;
   concerts_count: number;
   orders_count: number;
-  revenue_total: number;
   created_at: string;
 }
 
@@ -44,9 +50,13 @@ export interface AdminUser {
   id: number;
   name: string;
   email: string;
-  role: "SUPER_ADMIN" | "ORGANIZER";
+  role: "SUPER_ADMIN" | "ORGANIZER" | "STAFF_SCANNER";
   slug: string;
   must_change_password: boolean;
+  commission_rate?: number;
+  parent_organizer_id?: number | null;
+  assigned_concert_id?: number | null;
+  totp_enabled?: boolean;
 }
 
 export interface TicketInfo {
@@ -96,6 +106,13 @@ export interface DashRow {
   remaining: number;
   revenue_paid: number;
   revenue_pending: number;
+  fill_rate?: number;
+  attendance_rate?: number;
+  tickets_used?: number;
+  tickets_generated?: number;
+  commission_rate?: number;
+  commission_amount?: number;
+  net_revenue?: number;
 }
 
 export interface Dashboard {
@@ -105,8 +122,58 @@ export interface Dashboard {
     orders_rejected: number;
     tickets_generated: number;
     tickets_used: number;
+    overall_fill_rate: number;
+    overall_attendance_rate: number;
+    commission_amount: number;
+    net_revenue: number;
+    payouts_total: number;
+    balance_due: number;
   };
   per_concert: DashRow[];
+}
+
+export interface Payout {
+  id: number;
+  organizer_id: number;
+  organizer_name: string;
+  amount: number;
+  payment_method: string;
+  reference: string;
+  notes?: string | null;
+  created_at: string;
+}
+
+export interface StaffMember {
+  id: number;
+  name: string;
+  email: string;
+  role: "STAFF_SCANNER";
+  parent_organizer_id?: number | null;
+  assigned_concert_id?: number | null;
+  assigned_concert_name?: string | null;
+  is_active: boolean;
+  created_at: string;
+}
+
+export interface OfflineTicket {
+  token: string;
+  ticket_number: string;
+  status: "VALID" | "USED";
+  payment_status: string;
+  customer_name: string;
+  ticket_type: string;
+  unit_price: number;
+  used_at: string | null;
+}
+
+export interface OfflineManifest {
+  concert_id: number;
+  concert_name: string;
+  concert_date: string;
+  venue: string;
+  downloaded_at: string;
+  total_tickets: number;
+  tickets: OfflineTicket[];
 }
 
 export interface ScanResult {

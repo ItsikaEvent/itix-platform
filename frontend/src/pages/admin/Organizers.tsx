@@ -22,7 +22,7 @@ export default function Organizers() {
 
   // Create Modal
   const [createOpen, setCreateOpen] = useState(false);
-  const [createForm, setCreateForm] = useState({ name: "", email: "", phone: "", temp_password: "" });
+  const [createForm, setCreateForm] = useState({ name: "", email: "", phone: "", temp_password: "", commission_rate: 5.0 });
   const [creating, setCreating] = useState(false);
   const [createSuccessData, setCreateSuccessData] = useState<{ email: string; temp: string } | null>(null);
 
@@ -59,7 +59,7 @@ export default function Organizers() {
         email: res.data.email,
         temp: res.data.temporary_password,
       });
-      setCreateForm({ name: "", email: "", phone: "", temp_password: "" });
+      setCreateForm({ name: "", email: "", phone: "", temp_password: "", commission_rate: 5.0 });
       fetchOrganizers();
     } catch (err) {
       setError(errorMessage(err, "Erreur lors de la création de l'organisateur."));
@@ -139,9 +139,11 @@ export default function Organizers() {
               <thead className="border-b border-[#ECEAE6] bg-[#FAF9F6] text-[#555555]">
                 <tr>
                   <th className="px-5 py-3 font-semibold">Organisateur / Contact</th>
-                  <th className="px-4 py-3 font-semibold">Rôle & Page Publique</th>
+                  <th className="px-4 py-3 font-semibold">Rôle & Page</th>
                   <th className="px-4 py-3 font-semibold">Événements</th>
-                  <th className="px-4 py-3 font-semibold">Ventes & Revenus</th>
+                  <th className="px-4 py-3 font-semibold">Ventes brutes</th>
+                  <th className="px-4 py-3 font-semibold">Commission ITIX</th>
+                  <th className="px-4 py-3 font-semibold">Net & Solde dû</th>
                   <th className="px-4 py-3 font-semibold">Statut</th>
                   <th className="px-5 py-3 font-semibold text-right">Actions</th>
                 </tr>
@@ -196,6 +198,25 @@ export default function Organizers() {
                       </div>
                       <div className="text-[11px] text-[#777777]">
                         {org.orders_count} commande{org.orders_count > 1 ? "s" : ""}
+                      </div>
+                    </td>
+
+                    <td className="px-4 py-4">
+                      <div className="font-semibold text-xs text-[#641C2D]">
+                        {org.commission_rate ?? 5}%
+                      </div>
+                      <div className="text-[11px] text-[#777777]">
+                        {formatAr(org.commission_total ?? 0)}
+                      </div>
+                    </td>
+
+                    <td className="px-4 py-4">
+                      <div className="text-xs">
+                        <span className="text-[#777777]">Net : </span>
+                        <strong className="text-[#111111]">{formatAr(org.revenue_net ?? 0)}</strong>
+                      </div>
+                      <div className="text-[11px] text-[#641C2D] font-semibold mt-0.5">
+                        Solde dû : {formatAr(org.balance_due ?? 0)}
                       </div>
                     </td>
 
@@ -329,6 +350,23 @@ export default function Organizers() {
                     className="w-full rounded-lg border border-[#DCD9D3] bg-[#FFFFFF] px-3 py-2 text-xs text-[#111111] focus:border-[#641C2D] focus:outline-none"
                   />
                 </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-[#333333] mb-1">
+                  Taux de commission ITIX (%) *
+                </label>
+                <input
+                  type="number"
+                  step="0.5"
+                  min="0"
+                  max="100"
+                  required
+                  value={createForm.commission_rate}
+                  onChange={(e) => setCreateForm({ ...createForm, commission_rate: Number(e.target.value) })}
+                  className="w-full rounded-lg border border-[#DCD9D3] bg-[#FFFFFF] px-3 py-2 text-xs text-[#111111] focus:border-[#641C2D] focus:outline-none"
+                />
+                <p className="text-[10px] text-gray-500 mt-0.5">Taux standard par défaut : 5%</p>
               </div>
 
               <div>

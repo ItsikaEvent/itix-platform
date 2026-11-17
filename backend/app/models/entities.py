@@ -2,7 +2,7 @@ import re
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, LargeBinary, String, Text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, LargeBinary, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.timeutil import local_now
@@ -12,7 +12,7 @@ from app.db.base import Base
 ORDER_PENDING, ORDER_ACCEPTED, ORDER_REJECTED = "PENDING", "ACCEPTED", "REJECTED"
 PAY_UNPAID, PAY_PROOF, PAY_PAID = "UNPAID", "PROOF_SUBMITTED", "PAID"
 TICKET_VALID, TICKET_USED = "VALID", "USED"
-ROLE_SUPER_ADMIN, ROLE_ORGANIZER = "SUPER_ADMIN", "ORGANIZER"
+ROLE_SUPER_ADMIN, ROLE_ORGANIZER, ROLE_STAFF_SCANNER = "SUPER_ADMIN", "ORGANIZER", "STAFF_SCANNER"
 
 
 def _uuid() -> str:
@@ -46,9 +46,21 @@ class Admin(Base):
     phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    commission_rate: Mapped[float] = mapped_column(Float, default=5.0)  # Taux commission ITIX (ex: 5.0%)
+    totp_secret: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    parent_organizer_id: Mapped[int | None] = mapped_column(
+        ForeignKey("admins.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    assigned_concert_id: Mapped[int | None] = mapped_column(
+        ForeignKey("concerts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
 
     concerts: Mapped[list["Concert"]] = relationship(
+        back_populates="organizer", foreign_keys="Concert.organizer_id", cascade="all, delete-orphan", lazy="selectin"
+    )
+    payouts: Mapped[list["Payout"]] = relationship(
         back_populates="organizer", cascade="all, delete-orphan", lazy="selectin"
     )
 
@@ -69,7 +81,9 @@ class Concert(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
 
-    organizer: Mapped[Admin | None] = relationship(back_populates="concerts", lazy="selectin")
+    organizer: Mapped[Admin | None] = relationship(
+        back_populates="concerts", foreign_keys=[organizer_id], lazy="selectin"
+    )
     ticket_types: Mapped[list["TicketType"]] = relationship(
         back_populates="concert", cascade="all, delete-orphan",
         lazy="selectin", order_by="TicketType.price",
@@ -172,9 +186,26 @@ class ClientAccount(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(120))
-    totp_secret: Mapped[str] = mapped_column(String(64))
-    is_verified: Mapped[bool] = mapped_column(default=False)
+    totp_secret: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
+
+
+class Payout(Base):
+    __tablename__ = "payouts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organizer_id: Mapped[int] = mapped_column(
+        ForeignKey("admins.id", ondelete="CASCADE"), index=True
+    )
+    amount: Mapped[int] = mapped_column(Integer)  # Net reversé en Ariary
+    payment_method: Mapped[str] = mapped_column(String(30))  # MVOLA, ORANGE_MONEY, AIRTEL_MONEY, BANK_TRANSFER, CASH
+    reference: Mapped[str] = mapped_column(String(100))  # Référence transaction opérateur
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=local_now)
+
+    organizer: Mapped["Admin"] = relationship("Admin", back_populates="payouts", lazy="joined")
+
 
 
 

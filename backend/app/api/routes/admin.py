@@ -1,4 +1,6 @@
 import base64
+import csv
+import io
 import secrets
 from datetime import datetime
 
@@ -8,15 +10,17 @@ from pydantic import BaseModel, EmailStr, Field, TypeAdapter, ValidationError
 from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_admin, require_super_admin
+from app.api.deps import (get_current_admin, require_admin_or_organizer,
+                         require_scanner_access, require_super_admin)
 from app.core.config import get_settings
-from app.core.security import decrypt_ticket, hash_password
+from app.core.limiter import rate_limit
+from app.core.security import decrypt_ticket, encrypt_ticket, hash_password
 from app.core.timeutil import local_now
 from app.db.session import get_db
-from app.models.entities import (Admin, ChatMessage, Concert, Order,
-                                 ROLE_ORGANIZER, ROLE_SUPER_ADMIN,
-                                 StoredFile, SupportMessage, Ticket,
-                                 TicketType, slugify)
+from app.models.entities import (Admin, ChatMessage, Concert, Order, Payout,
+                                 ROLE_ORGANIZER, ROLE_STAFF_SCANNER,
+                                 ROLE_SUPER_ADMIN, StoredFile, SupportMessage,
+                                 Ticket, TicketType, slugify)
 from app.services.files import save_image
 from app.services.mailer import send_test_email, send_tickets_email, smtp_configured
 from app.services.presenters import concert_out, order_out, sold_map
@@ -46,12 +50,14 @@ class CreateOrganizerIn(BaseModel):
     email: EmailStr
     phone: str | None = Field(default=None, max_length=30)
     temp_password: str | None = Field(default=None, min_length=6, max_length=64)
+    commission_rate: float = Field(default=5.0, ge=0.0, le=100.0)
 
 
 class UpdateOrganizerIn(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=120)
     phone: str | None = Field(default=None, max_length=30)
     is_active: bool | None = None
+    commission_rate: float | None = Field(default=None, ge=0.0, le=100.0)
 
 
 @router.get("/organizers")
@@ -59,7 +65,11 @@ def list_organizers(
     current: Admin = Depends(require_super_admin),
     db: Session = Depends(get_db),
 ):
-    orgs = db.scalars(select(Admin).order_by(Admin.id.asc())).all()
+    orgs = db.scalars(
+        select(Admin)
+        .where(Admin.role.in_([ROLE_SUPER_ADMIN, ROLE_ORGANIZER]))
+        .order_by(Admin.id.asc())
+    ).all()
     result = []
     for org in orgs:
         c_count = db.scalar(select(func.count(Concert.id)).where(Concert.organizer_id == org.id)) or 0
@@ -74,6 +84,15 @@ def list_organizers(
             .where(Concert.organizer_id == org.id, Order.payment_status == "PAID", Order.status != "REJECTED")
         ) or 0
 
+        rate = org.commission_rate if org.commission_rate is not None else 5.0
+        rev_int = int(rev)
+        comm_total = int(rev_int * (rate / 100.0))
+        net_total = rev_int - comm_total
+        payouts_total = int(
+            db.scalar(select(func.coalesce(func.sum(Payout.amount), 0)).where(Payout.organizer_id == org.id)) or 0
+        )
+        balance_due = net_total - payouts_total
+
         result.append({
             "id": org.id,
             "name": org.name,
@@ -82,10 +101,16 @@ def list_organizers(
             "role": org.role,
             "slug": org.slug,
             "is_active": org.is_active,
+            "commission_rate": rate,
+            "commission_total": comm_total,
+            "revenue_total": rev_int,
+            "revenue_net": net_total,
+            "payouts_total": payouts_total,
+            "balance_due": balance_due,
             "must_change_password": org.must_change_password,
+            "totp_enabled": org.totp_enabled,
             "concerts_count": c_count,
             "orders_count": o_count,
-            "revenue_total": int(rev),
             "created_at": org.created_at.isoformat() if org.created_at else None,
         })
     return result
@@ -118,6 +143,7 @@ def create_organizer(
         role=ROLE_ORGANIZER,
         slug=slug,
         password_hash=hash_password(temp_pass),
+        commission_rate=body.commission_rate,
         must_change_password=True,
         is_active=True,
     )
@@ -132,6 +158,7 @@ def create_organizer(
         "phone": org.phone,
         "role": org.role,
         "slug": org.slug,
+        "commission_rate": org.commission_rate,
         "temporary_password": temp_pass,
         "must_change_password": org.must_change_password,
         "message": "Compte organisateur créé avec succès. Transmettez le mot de passe temporaire.",
@@ -154,8 +181,16 @@ def update_organizer(
         org.phone = body.phone.strip() if body.phone else None
     if body.is_active is not None:
         org.is_active = body.is_active
+    if body.commission_rate is not None:
+        org.commission_rate = body.commission_rate
     db.commit()
-    return {"message": "Organisateur mis à jour.", "id": org.id, "name": org.name, "is_active": org.is_active}
+    return {
+        "message": "Organisateur mis à jour.",
+        "id": org.id,
+        "name": org.name,
+        "is_active": org.is_active,
+        "commission_rate": org.commission_rate,
+    }
 
 
 @router.post("/organizers/{organizer_id}/reset-password")
@@ -205,6 +240,167 @@ def delete_or_deactivate_organizer(
     return {"message": "Compte organisateur supprimé avec succès."}
 
 
+# ------------------------------------------------------------------ Modèle Économique : Commissions & Reversements (Payouts)
+class CreatePayoutIn(BaseModel):
+    organizer_id: int
+    amount: int = Field(..., ge=1000)
+    payment_method: str = Field(..., min_length=2, max_length=30)
+    reference: str = Field(..., min_length=2, max_length=100)
+    notes: str | None = None
+
+
+@router.get("/payouts")
+def list_payouts(
+    organizer_id: int | None = None,
+    current: Admin = Depends(require_admin_or_organizer),
+    db: Session = Depends(get_db),
+):
+    stmt = select(Payout).order_by(Payout.created_at.desc())
+    if current.role == ROLE_ORGANIZER:
+        stmt = stmt.where(Payout.organizer_id == current.id)
+    elif current.role == ROLE_SUPER_ADMIN and organizer_id:
+        stmt = stmt.where(Payout.organizer_id == organizer_id)
+
+    payouts = db.scalars(stmt).all()
+    return [
+        {
+            "id": p.id,
+            "organizer_id": p.organizer_id,
+            "organizer_name": p.organizer.name if p.organizer else "Organisateur",
+            "amount": p.amount,
+            "payment_method": p.payment_method,
+            "reference": p.reference,
+            "notes": p.notes,
+            "created_at": p.created_at.isoformat(),
+        }
+        for p in payouts
+    ]
+
+
+@router.post("/payouts", status_code=201)
+def create_payout(
+    body: CreatePayoutIn,
+    current: Admin = Depends(require_super_admin),
+    db: Session = Depends(get_db),
+):
+    org = db.get(Admin, body.organizer_id)
+    if not org or org.role != ROLE_ORGANIZER:
+        raise HTTPException(404, "Organisateur introuvable.")
+
+    p = Payout(
+        organizer_id=body.organizer_id,
+        amount=body.amount,
+        payment_method=body.payment_method.strip().upper(),
+        reference=body.reference.strip(),
+        notes=body.notes.strip() if body.notes else None,
+    )
+    db.add(p)
+    db.commit()
+    db.refresh(p)
+    return {
+        "id": p.id,
+        "organizer_id": p.organizer_id,
+        "organizer_name": org.name,
+        "amount": p.amount,
+        "payment_method": p.payment_method,
+        "reference": p.reference,
+        "created_at": p.created_at.isoformat(),
+        "message": f"Reversement de {p.amount:,} Ar enregistré avec succès.".replace(",", " "),
+    }
+
+
+# ------------------------------------------------------------------ Sous-Comptes Staff Scanner
+class CreateStaffIn(BaseModel):
+    name: str = Field(..., min_length=2, max_length=120)
+    email: EmailStr
+    password: str = Field(..., min_length=6, max_length=64)
+    assigned_concert_id: int | None = None
+
+
+@router.get("/staff")
+def list_staff(
+    current: Admin = Depends(require_admin_or_organizer),
+    db: Session = Depends(get_db),
+):
+    stmt = select(Admin).where(Admin.role == ROLE_STAFF_SCANNER).order_by(Admin.id.desc())
+    if current.role == ROLE_ORGANIZER:
+        stmt = stmt.where(Admin.parent_organizer_id == current.id)
+
+    staff_list = db.scalars(stmt).all()
+    result = []
+    for s in staff_list:
+        concert = db.get(Concert, s.assigned_concert_id) if s.assigned_concert_id else None
+        result.append({
+            "id": s.id,
+            "name": s.name,
+            "email": s.email,
+            "role": s.role,
+            "parent_organizer_id": s.parent_organizer_id,
+            "assigned_concert_id": s.assigned_concert_id,
+            "assigned_concert_name": concert.name if concert else None,
+            "is_active": s.is_active,
+            "created_at": s.created_at.isoformat(),
+        })
+    return result
+
+
+@router.post("/staff", status_code=201)
+def create_staff(
+    body: CreateStaffIn,
+    current: Admin = Depends(require_admin_or_organizer),
+    db: Session = Depends(get_db),
+):
+    clean_email = str(body.email).strip().lower()
+    if db.scalar(select(Admin.id).where(Admin.email == clean_email)):
+        raise HTTPException(409, "Un compte avec cette adresse e-mail existe déjà.")
+
+    if body.assigned_concert_id:
+        c = db.get(Concert, body.assigned_concert_id)
+        if not c:
+            raise HTTPException(404, "Concert assigné introuvable.")
+        if current.role == ROLE_ORGANIZER and c.organizer_id != current.id:
+            raise HTTPException(403, "Vous ne pouvez assigner que vos propres concerts.")
+
+    staff = Admin(
+        name=body.name.strip(),
+        email=clean_email,
+        role=ROLE_STAFF_SCANNER,
+        password_hash=hash_password(body.password),
+        parent_organizer_id=current.id if current.role == ROLE_ORGANIZER else None,
+        assigned_concert_id=body.assigned_concert_id,
+        must_change_password=False,
+        is_active=True,
+    )
+    db.add(staff)
+    db.commit()
+    db.refresh(staff)
+    return {
+        "id": staff.id,
+        "name": staff.name,
+        "email": staff.email,
+        "role": staff.role,
+        "assigned_concert_id": staff.assigned_concert_id,
+        "message": f"Sous-compte contrôleur créé pour {staff.name}.",
+    }
+
+
+@router.delete("/staff/{staff_id}", status_code=204)
+def delete_staff(
+    staff_id: int,
+    current: Admin = Depends(require_admin_or_organizer),
+    db: Session = Depends(get_db),
+):
+    staff = db.get(Admin, staff_id)
+    if not staff or staff.role != ROLE_STAFF_SCANNER:
+        raise HTTPException(404, "Compte contrôleur introuvable.")
+    if current.role == ROLE_ORGANIZER and staff.parent_organizer_id != current.id:
+        raise HTTPException(403, "Accès refusé.")
+
+    db.delete(staff)
+    db.commit()
+    return Response(status_code=204)
+
+
 # ------------------------------------------------------------------ Concerts
 class TicketTypeIn(BaseModel):
     id: int | None = None
@@ -228,7 +424,7 @@ def _parse_types(raw: str, total_seats: int) -> list[TicketTypeIn]:
 @router.get("/concerts")
 def list_admin_concerts(
     organizer_id: int | None = None,
-    current: Admin = Depends(get_current_admin),
+    current: Admin = Depends(require_admin_or_organizer),
     db: Session = Depends(get_db),
 ):
     stmt = select(Concert).order_by(Concert.date.desc())
@@ -363,7 +559,7 @@ def delete_concert(
 def dashboard(
     concert_id: int | None = None,
     organizer_id: int | None = None,
-    current: Admin = Depends(get_current_admin),
+    current: Admin = Depends(require_admin_or_organizer),
     db: Session = Depends(get_db),
 ):
     q = select(Concert).order_by(Concert.date)
@@ -382,8 +578,11 @@ def dashboard(
         empty_total = {
             "total_seats": 0, "ordered": 0, "paid": 0, "unpaid": 0,
             "remaining": 0, "revenue_paid": 0, "revenue_pending": 0,
+            "commission_amount": 0, "net_revenue": 0,
             "orders_pending": 0, "orders_accepted": 0, "orders_rejected": 0,
             "tickets_generated": 0, "tickets_used": 0,
+            "overall_fill_rate": 0.0, "overall_attendance_rate": 0.0,
+            "payouts_total": 0, "balance_due": 0,
         }
         return {"totals": empty_total, "per_concert": []}
 
@@ -410,19 +609,56 @@ def dashboard(
     per_concert = []
     for c in concerts:
         ordered, paid_q, rev_paid, rev_pending = (int(x) for x in agg.get(c.id, (0, 0, 0, 0)))
+        fill_rate = round((ordered / c.total_seats) * 100, 1) if c.total_seats > 0 else 0.0
+        c_used = db.scalar(select(func.count(Ticket.id)).where(Ticket.concert_id == c.id, Ticket.status == "USED")) or 0
+        c_tck = db.scalar(select(func.count(Ticket.id)).where(Ticket.concert_id == c.id)) or 0
+        attendance_rate = round((c_used / c_tck) * 100, 1) if c_tck > 0 else 0.0
+        comm_rate = c.organizer.commission_rate if c.organizer else 5.0
+        comm_amount = int(round(rev_paid * (comm_rate / 100.0)))
+        net_org = rev_paid - comm_amount
         per_concert.append({
             "id": c.id, "name": c.name, "date": c.date, "total_seats": c.total_seats,
             "organizer_name": c.organizer.name if c.organizer else "ITIX",
             "ordered": ordered, "paid": paid_q, "unpaid": ordered - paid_q,
             "remaining": c.total_seats - ordered,
             "revenue_paid": rev_paid, "revenue_pending": rev_pending,
+            "fill_rate": fill_rate,
+            "attendance_rate": attendance_rate,
+            "tickets_used": c_used,
+            "tickets_generated": c_tck,
+            "commission_rate": comm_rate,
+            "commission_amount": comm_amount,
+            "net_revenue": net_org,
         })
     total = {k: sum(p[k] for p in per_concert) for k in
-             ("total_seats", "ordered", "paid", "unpaid", "remaining", "revenue_paid", "revenue_pending")}
-    return {"totals": {**total, "orders_pending": counts["PENDING"], "orders_accepted": counts["ACCEPTED"],
-                       "orders_rejected": counts["REJECTED"], "tickets_generated": int(t_gen),
-                       "tickets_used": int(t_used)},
-            "per_concert": per_concert}
+             ("total_seats", "ordered", "paid", "unpaid", "remaining", "revenue_paid", "revenue_pending", "commission_amount", "net_revenue")}
+
+    payout_stmt = select(func.coalesce(func.sum(Payout.amount), 0))
+    if current.role == ROLE_ORGANIZER:
+        payout_stmt = payout_stmt.where(Payout.organizer_id == current.id)
+    elif current.role == ROLE_SUPER_ADMIN and organizer_id:
+        payout_stmt = payout_stmt.where(Payout.organizer_id == organizer_id)
+    payouts_total = int(db.scalar(payout_stmt) or 0)
+    balance_due = max(0, total["net_revenue"] - payouts_total)
+
+    overall_fill_rate = round((total["ordered"] / total["total_seats"]) * 100, 1) if total["total_seats"] > 0 else 0.0
+    overall_attendance_rate = round((int(t_used) / int(t_gen)) * 100, 1) if int(t_gen) > 0 else 0.0
+
+    return {
+        "totals": {
+            **total,
+            "orders_pending": counts["PENDING"],
+            "orders_accepted": counts["ACCEPTED"],
+            "orders_rejected": counts["REJECTED"],
+            "tickets_generated": int(t_gen),
+            "tickets_used": int(t_used),
+            "overall_fill_rate": overall_fill_rate,
+            "overall_attendance_rate": overall_attendance_rate,
+            "payouts_total": payouts_total,
+            "balance_due": balance_due,
+        },
+        "per_concert": per_concert,
+    }
 
 
 # ------------------------------------------------------------------ Commandes
@@ -435,7 +671,7 @@ def list_orders(
     q: str | None = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(15, ge=1, le=100),
-    current: Admin = Depends(get_current_admin),
+    current: Admin = Depends(require_admin_or_organizer),
     db: Session = Depends(get_db),
 ):
     stmt = select(Order).join(Concert, Order.concert_id == Concert.id)
@@ -465,10 +701,71 @@ def list_orders(
     return {"items": [order_out(o) for o in items], "total": total, "page": page, "page_size": page_size}
 
 
+@router.get("/orders/export-csv")
+def export_orders_csv(
+    concert_id: int | None = None,
+    organizer_id: int | None = None,
+    current: Admin = Depends(require_admin_or_organizer),
+    db: Session = Depends(get_db),
+):
+    stmt = select(Order).join(Concert, Order.concert_id == Concert.id).order_by(Order.id.desc())
+    if current.role == ROLE_ORGANIZER:
+        stmt = stmt.where(Concert.organizer_id == current.id)
+    elif current.role == ROLE_SUPER_ADMIN and organizer_id:
+        stmt = stmt.where(Concert.organizer_id == organizer_id)
+    if concert_id:
+        stmt = stmt.where(Order.concert_id == concert_id)
+
+    orders = db.scalars(stmt).all()
+
+    output = io.StringIO()
+    output.write("\ufeff")  # BOM UTF-8
+    writer = csv.writer(output, delimiter=";")
+    writer.writerow([
+        "Référence",
+        "Concert",
+        "Organisateur",
+        "Client",
+        "Email",
+        "Type de billet",
+        "Quantité",
+        "Prix unitaire (Ar)",
+        "Montant total (Ar)",
+        "Statut commande",
+        "Statut paiement",
+        "Date de commande",
+    ])
+
+    for o in orders:
+        writer.writerow([
+            o.reference,
+            o.concert.name if o.concert else "",
+            o.concert.organizer.name if o.concert and o.concert.organizer else "ITIX",
+            o.customer_name,
+            o.customer_email,
+            o.ticket_type.name if o.ticket_type else "",
+            o.quantity,
+            o.unit_price,
+            o.total_amount,
+            o.status,
+            o.payment_status,
+            o.created_at.strftime("%d/%m/%Y %H:%M") if o.created_at else "",
+        ])
+
+    csv_data = output.getvalue()
+    return Response(
+        content=csv_data,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="commandes_itix_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv"'
+        },
+    )
+
+
 @router.get("/orders/{order_id}")
 def order_detail(
     order_id: int,
-    current: Admin = Depends(get_current_admin),
+    current: Admin = Depends(require_admin_or_organizer),
     db: Session = Depends(get_db),
 ):
     return order_out(_get_order(db, order_id, current))
@@ -477,7 +774,7 @@ def order_detail(
 @router.get("/orders/{order_id}/proof")
 def order_proof(
     order_id: int,
-    current: Admin = Depends(get_current_admin),
+    current: Admin = Depends(require_admin_or_organizer),
     db: Session = Depends(get_db),
 ):
     o = _get_order(db, order_id, current)
@@ -520,7 +817,7 @@ def accept_order(
     order_id: int,
     body: AcceptIn,
     bg: BackgroundTasks,
-    current: Admin = Depends(get_current_admin),
+    current: Admin = Depends(require_admin_or_organizer),
     db: Session = Depends(get_db),
 ):
     o = _get_order(db, order_id, current, lock=True)
@@ -543,7 +840,7 @@ def accept_order(
 def resend_tickets(
     order_id: int,
     bg: BackgroundTasks,
-    current: Admin = Depends(get_current_admin),
+    current: Admin = Depends(require_admin_or_organizer),
     db: Session = Depends(get_db),
 ):
     o = _get_order(db, order_id, current)
@@ -560,7 +857,7 @@ class RejectIn(BaseModel):
 def reject_order(
     order_id: int,
     body: RejectIn,
-    current: Admin = Depends(get_current_admin),
+    current: Admin = Depends(require_admin_or_organizer),
     db: Session = Depends(get_db),
 ):
     o = _get_order(db, order_id, current, lock=True)
@@ -574,7 +871,7 @@ def reject_order(
 @router.post("/orders/{order_id}/mark-paid")
 def mark_paid(
     order_id: int,
-    current: Admin = Depends(get_current_admin),
+    current: Admin = Depends(require_admin_or_organizer),
     db: Session = Depends(get_db),
 ):
     o = _get_order(db, order_id, current, lock=True)
@@ -585,7 +882,7 @@ def mark_paid(
     return order_out(o)
 
 
-# ------------------------------------------------------------------ Scan QR
+# ------------------------------------------------------------------ Scan QR & Mode Hors-ligne
 class ScanIn(BaseModel):
     token: str = Field(min_length=1, max_length=2000)
     mark_used: bool = True
@@ -594,8 +891,9 @@ class ScanIn(BaseModel):
 @router.post("/scan")
 def scan(
     body: ScanIn,
-    current: Admin = Depends(get_current_admin),
+    current: Admin = Depends(require_scanner_access),
     db: Session = Depends(get_db),
+    _limiter: None = Depends(rate_limit(max_requests=120, window_seconds=60, key_prefix="scan")),
 ):
     """Le backend déchiffre, vérifie l'organisateur propriétaire, contrôle paiement et usage atomique."""
     pid = decrypt_ticket(body.token)
@@ -606,13 +904,26 @@ def scan(
     o = t.order
     concert = o.concert
 
-    # Isolation multi-organisateur stricte
+    # Isolation multi-organisateur stricte & contrôleur staff
     if current.role == ROLE_ORGANIZER and concert.organizer_id != current.id:
         return {
             "result": "WRONG_ORGANIZER",
             "message": f"Accès refusé : Ce billet est valide pour l'événement « {concert.name} » d'un autre organisateur.",
             "ticket": None,
         }
+    if current.role == ROLE_STAFF_SCANNER:
+        if current.assigned_concert_id and concert.id != current.assigned_concert_id:
+            return {
+                "result": "WRONG_ORGANIZER",
+                "message": f"Accès refusé : Vous n'êtes pas assigné à l'événement « {concert.name} ».",
+                "ticket": None,
+            }
+        if current.parent_organizer_id and concert.organizer_id != current.parent_organizer_id:
+            return {
+                "result": "WRONG_ORGANIZER",
+                "message": f"Accès refusé : Ce billet appartient à un autre organisateur.",
+                "ticket": None,
+            }
 
     def info() -> dict:
         return {
@@ -651,6 +962,124 @@ def scan(
     return {"result": "VALID", "message": "✓ Billet valide : entrée autorisée (Paiement validé).", "ticket": info()}
 
 
+@router.get("/scanner/manifest")
+def get_scanner_manifest(
+    concert_id: int = Query(...),
+    current: Admin = Depends(require_scanner_access),
+    db: Session = Depends(get_db),
+):
+    concert = db.get(Concert, concert_id)
+    if not concert:
+        raise HTTPException(404, "Concert introuvable.")
+
+    if current.role == ROLE_ORGANIZER and concert.organizer_id != current.id:
+        raise HTTPException(403, "Accès refusé pour cet événement.")
+    if current.role == ROLE_STAFF_SCANNER:
+        if current.assigned_concert_id and current.assigned_concert_id != concert.id:
+            raise HTTPException(403, "Accès refusé : vous n'êtes pas affecté à ce concert.")
+        if current.parent_organizer_id and concert.organizer_id != current.parent_organizer_id:
+            raise HTTPException(403, "Accès refusé pour cet événement.")
+
+    tickets = db.scalars(
+        select(Ticket)
+        .join(Order, Ticket.order_id == Order.id)
+        .where(Ticket.concert_id == concert_id)
+    ).all()
+
+    manifest_tickets = []
+    for t in tickets:
+        token = encrypt_ticket(t.public_id)
+        manifest_tickets.append({
+            "token": token,
+            "ticket_number": t.number,
+            "status": t.status,
+            "payment_status": t.order.payment_status,
+            "customer_name": t.order.customer_name,
+            "ticket_type": t.order.ticket_type.name,
+            "unit_price": t.order.unit_price,
+            "used_at": t.used_at.isoformat() if t.used_at else None,
+        })
+
+    return {
+        "concert_id": concert.id,
+        "concert_name": concert.name,
+        "concert_date": concert.date.isoformat(),
+        "venue": concert.venue,
+        "downloaded_at": local_now().isoformat(),
+        "total_tickets": len(manifest_tickets),
+        "tickets": manifest_tickets,
+    }
+
+
+class OfflineSyncItem(BaseModel):
+    token: str
+    scanned_at: str | None = None
+
+
+class OfflineSyncIn(BaseModel):
+    concert_id: int
+    scans: list[OfflineSyncItem]
+
+
+@router.post("/scanner/sync-offline")
+def sync_offline_scans(
+    body: OfflineSyncIn,
+    current: Admin = Depends(require_scanner_access),
+    db: Session = Depends(get_db),
+):
+    concert = db.get(Concert, body.concert_id)
+    if not concert:
+        raise HTTPException(404, "Concert introuvable.")
+
+    if current.role == ROLE_ORGANIZER and concert.organizer_id != current.id:
+        raise HTTPException(403, "Accès refusé pour cet événement.")
+    if current.role == ROLE_STAFF_SCANNER:
+        if current.assigned_concert_id and current.assigned_concert_id != concert.id:
+            raise HTTPException(403, "Accès refusé : vous n'êtes pas affecté à ce concert.")
+        if current.parent_organizer_id and concert.organizer_id != current.parent_organizer_id:
+            raise HTTPException(403, "Accès refusé pour cet événement.")
+
+    synced = 0
+    already_used = 0
+    invalid = 0
+
+    for scan in body.scans:
+        pid = decrypt_ticket(scan.token)
+        if not pid:
+            invalid += 1
+            continue
+        t = db.scalar(select(Ticket).where(Ticket.public_id == pid, Ticket.concert_id == body.concert_id))
+        if not t:
+            invalid += 1
+            continue
+
+        if t.status == "USED":
+            already_used += 1
+            continue
+
+        scan_time = None
+        if scan.scanned_at:
+            try:
+                scan_time = datetime.fromisoformat(scan.scanned_at)
+            except Exception:
+                scan_time = local_now()
+        else:
+            scan_time = local_now()
+
+        t.status = "USED"
+        t.used_at = scan_time
+        synced += 1
+
+    db.commit()
+    return {
+        "message": f"{synced} scan(s) synchronisé(s) avec succès.",
+        "synced": synced,
+        "already_used": already_used,
+        "invalid": invalid,
+        "total": len(body.scans),
+    }
+
+
 # ------------------------------------------------------------------ E-mail & SMTP Diagnostics
 class TestEmailIn(BaseModel):
     recipient: str = Field(..., min_length=3, max_length=255)
@@ -668,7 +1097,10 @@ def get_email_status():
 
 
 @router.post("/email/test")
-def test_email(body: TestEmailIn):
+def test_email(
+    body: TestEmailIn,
+    current: Admin = Depends(require_super_admin),
+):
     result = send_test_email(body.recipient.strip())
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result)
@@ -678,7 +1110,7 @@ def test_email(body: TestEmailIn):
 # ------------------------------------------------------------------ Support & Messages
 @router.get("/messages")
 def list_admin_messages(
-    current: Admin = Depends(get_current_admin),
+    current: Admin = Depends(require_admin_or_organizer),
     db: Session = Depends(get_db),
 ):
     stmt = select(SupportMessage).order_by(SupportMessage.id.desc())
@@ -718,7 +1150,7 @@ class ReplyIn(BaseModel):
 def reply_admin_message(
     msg_id: int,
     body: ReplyIn,
-    current: Admin = Depends(get_current_admin),
+    current: Admin = Depends(require_admin_or_organizer),
     db: Session = Depends(get_db),
 ):
     m = db.get(SupportMessage, msg_id)
@@ -741,7 +1173,7 @@ def reply_admin_message(
 @router.post("/messages/{msg_id}/toggle-resolved")
 def toggle_resolved_message(
     msg_id: int,
-    current: Admin = Depends(get_current_admin),
+    current: Admin = Depends(require_admin_or_organizer),
     db: Session = Depends(get_db),
 ):
     m = db.get(SupportMessage, msg_id)
@@ -761,7 +1193,7 @@ def toggle_resolved_message(
 # ------------------------------------------------------------------ Chat Admin
 @router.get("/chat/conversations")
 def list_chat_conversations(
-    current: Admin = Depends(get_current_admin),
+    current: Admin = Depends(require_admin_or_organizer),
     db: Session = Depends(get_db),
 ):
     stmt = select(ChatMessage).order_by(ChatMessage.created_at.desc())
@@ -790,7 +1222,7 @@ def list_chat_conversations(
 @router.get("/chat/{customer_email}")
 def get_admin_chat(
     customer_email: str,
-    current: Admin = Depends(get_current_admin),
+    current: Admin = Depends(require_admin_or_organizer),
     db: Session = Depends(get_db),
 ):
     clean_email = customer_email.strip().lower()
@@ -826,7 +1258,7 @@ class AdminChatMessageIn(BaseModel):
 def post_admin_chat_reply(
     customer_email: str,
     body: AdminChatMessageIn,
-    current: Admin = Depends(get_current_admin),
+    current: Admin = Depends(require_admin_or_organizer),
     db: Session = Depends(get_db),
 ):
     clean_email = customer_email.strip().lower()
